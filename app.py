@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Field Services Nationwide - AI Calling System
-Main Flask Application - FIXED VERSION
+Main Flask Application - OpenAI VERSION
 """
 
 import os
@@ -51,11 +51,11 @@ login_manager.login_view = 'login'
 login_manager.login_message = 'Please log in to access this page.'
 login_manager.login_message_category = 'info'
 
-# Configuration
+# Configuration - CHANGED TO OPENAI
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
@@ -220,33 +220,62 @@ class WorkOrderForm(FlaskForm):
     background_check = BooleanField('Background Check Required')
     min_experience = IntegerField('Minimum Experience (years)', validators=[NumberRange(min=0, max=30)], default=0)
 
-# ==================== HELPER FUNCTIONS ====================
+# ==================== OPENAI INTEGRATION ====================
 
-def call_gemini_api(prompt, model="gemini-2.0-flash"):
-    """Calls the Gemini API to generate text based on a prompt."""
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY is not set.")
-        return "I am sorry, I cannot generate a response right now."
+def call_openai_api(prompt, model="gpt-4o-mini"):
+    """
+    Calls the OpenAI API to generate text based on a prompt.
+    """
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is not set. Cannot call OpenAI API. Using fallback message.")
+        return "I am sorry, I cannot generate a response right now due to an internal configuration issue."
 
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-    headers = {'Content-Type': 'application/json'}
+    api_url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {OPENAI_API_KEY}'
+    }
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200}
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Sarah, a professional AI assistant from Field Services Nationwide. Keep responses conversational, under 30 seconds when spoken, and focused on determining job interest and availability."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "max_tokens": 150,
+        "temperature": 0.7
     }
 
     try:
+        logger.info(f"Calling OpenAI API with prompt: '{prompt[:100]}...'")
         response = requests.post(api_url, headers=headers, json=payload, timeout=20)
         response.raise_for_status()
         
         json_response = response.json()
-        if json_response and json_response.get('candidates'):
-            return json_response['candidates'][0]['content']['parts'][0]['text']
+        
+        if json_response and json_response.get('choices'):
+            generated_text = json_response['choices'][0]['message']['content']
+            logger.info(f"OpenAI API response (first 100 chars): '{generated_text[:100]}...'")
+            return generated_text
         else:
-            return "I am sorry, I couldn't generate a response."
+            logger.warning(f"OpenAI API returned no choices or unexpected format: {json_response}")
+            return "I am sorry, I couldn't generate a coherent response from the AI."
+    except requests.exceptions.Timeout:
+        logger.error("OpenAI API call timed out.")
+        return "I am sorry, the AI is taking too long to respond. Please try again."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling OpenAI API: {e}")
+        return f"I am sorry, there was a problem with the AI service: {str(e)}"
     except Exception as e:
-        logger.error(f"Error calling Gemini API: {e}")
-        return "I am sorry, there was a problem with the AI service."
+        logger.error(f"Unexpected error processing OpenAI API response: {e}")
+        return "I am sorry, an unexpected internal error occurred with the AI."
+
+# ==================== HELPER FUNCTIONS ====================
 
 def get_coordinates(address_string):
     """Fixed geocoding function that forces US locations only."""
@@ -528,10 +557,45 @@ def twilio_voice_webhook():
     call_log_id = request.args.get('call_log_id')
     
     if request.method == 'GET':
-        # Call answered - provide TwiML
+        # Call answered - provide TwiML with OpenAI
         logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
         response = TwiMLResponse()
-        response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?")
+        
+        # Get context for AI
+        if call_log_id:
+            call_log = CallLog.query.get(call_log_id)
+            if call_log:
+                technician = Technician.query.get(call_log.technician_id)
+                campaign = CallCampaign.query.get(call_log.campaign_id)
+                work_order = campaign.work_order if campaign else None
+                
+                # Build AI prompt with context
+                initial_prompt = (
+                    "Introduce yourself as Sarah from Field Services Nationwide. "
+                    "You're calling about a job opportunity. Keep it brief and ask if they're available to chat. "
+                )
+                
+                if technician and work_order:
+                    required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
+                    initial_prompt += (
+                        f"The technician's name is {technician.name}. "
+                        f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
+                        f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
+                    )
+                
+                ai_response = call_openai_api(initial_prompt)
+                if not ai_response:
+                    ai_response = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?"
+                
+                call_log.ai_conversation = f"AI: {ai_response}"
+                db.session.commit()
+                
+                response.say(ai_response)
+            else:
+                response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
+        else:
+            response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?")
+        
         response.gather(
             input='speech',
             speechTimeout='auto',
@@ -577,15 +641,24 @@ def twilio_handle_response():
                 conversation = call_log.ai_conversation or ""
                 conversation += f"\nTechnician: {speech_result}"
                 
-                # Generate AI response
+                # Get job context
+                campaign = call_log.campaign
+                work_order = campaign.work_order if campaign else None
+                job_info = ""
+                if work_order:
+                    job_info = f"Job: {work_order.job_category} in {work_order.job_city}, ${work_order.pay_rate}/hour"
+                
+                # Generate AI response using OpenAI
                 ai_prompt = (
                     f"Continue this conversation as Sarah from Field Services Nationwide:\n{conversation}\n\n"
+                    f"Job details: {job_info}\n\n"
                     f"Based on their response, continue talking about the job opportunity. "
                     f"Keep responses under 20 seconds. If they seem interested, tell them a recruiter will call back. "
-                    f"If not interested, politely end the call."
+                    f"If not interested, politely end the call. "
+                    f"If they need more info, provide job details briefly."
                 )
                 
-                ai_response = call_gemini_api(ai_prompt)
+                ai_response = call_openai_api(ai_prompt)
                 if not ai_response:
                     ai_response = "Thank you for your time. A recruiter will contact you soon if you're interested."
                 
@@ -605,9 +678,7 @@ def twilio_handle_response():
                     if "recruiter will call" in lower_response or "interested" in speech_result.lower():
                         call_log.call_result = 'interested'
                         # Update campaign responses
-                        campaign = call_log.campaign
                         campaign.current_responses += 1
-                        db.session.commit()
                     else:
                         call_log.call_result = 'not_interested'
                     
