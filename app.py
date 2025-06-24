@@ -171,9 +171,6 @@ class CallLog(db.Model):
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# Import calling functions from call.py
-from call import call_openai_api, make_ai_call
-
 # ==================== FORMS ====================
 
 class LoginForm(FlaskForm):
@@ -222,6 +219,61 @@ class WorkOrderForm(FlaskForm):
     drug_screen = BooleanField('Drug Screening Required')
     background_check = BooleanField('Background Check Required')
     min_experience = IntegerField('Minimum Experience (years)', validators=[NumberRange(min=0, max=30)], default=0)
+
+# ==================== OPENAI INTEGRATION ====================
+
+def call_openai_api(prompt, model="gpt-4o-mini"):
+    """
+    Calls the OpenAI API to generate text based on a prompt.
+    """
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is not set. Cannot call OpenAI API. Using fallback message.")
+        return "I am sorry, I cannot generate a response right now due to an internal configuration issue."
+
+    api_url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {OPENAI_API_KEY}'
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Sarah, a professional AI assistant from Field Services Nationwide. Keep responses conversational, under 30 seconds when spoken, and focused on determining job interest and availability."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "max_tokens": 150,
+        "temperature": 0.7
+    }
+
+    try:
+        logger.info(f"Calling OpenAI API with prompt: '{prompt[:100]}...'")
+        response = requests.post(api_url, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        
+        json_response = response.json()
+        
+        if json_response and json_response.get('choices'):
+            generated_text = json_response['choices'][0]['message']['content']
+            logger.info(f"OpenAI API response (first 100 chars): '{generated_text[:100]}...'")
+            return generated_text
+        else:
+            logger.warning(f"OpenAI API returned no choices or unexpected format: {json_response}")
+            return "I am sorry, I couldn't generate a coherent response from the AI."
+    except requests.exceptions.Timeout:
+        logger.error("OpenAI API call timed out.")
+        return "I am sorry, the AI is taking too long to respond. Please try again."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling OpenAI API: {e}")
+        return f"I am sorry, there was a problem with the AI service: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error processing OpenAI API response: {e}")
+        return "I am sorry, an unexpected internal error occurred with the AI."
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -380,6 +432,90 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
         logger.error(f"Error in find_qualified_technicians: {e}")
         return [], []
 
+def make_ai_call(campaign, tech_data):
+    """Fixed AI call function with better error handling."""
+    tech = tech_data['technician']
+    
+    logger.info(f"Making call to {tech.name} ({tech.mobile_phone})")
+    
+    try:
+        # Create call log
+        call_log = CallLog(
+            campaign_id=campaign.id,
+            technician_id=tech.id,
+            phone_number=tech.mobile_phone,
+            call_status='initiated',
+            distance_miles=tech_data['distance']
+        )
+        
+        db.session.add(call_log)
+        db.session.commit()
+
+        # Make Twilio call
+        if twilio_client and TWILIO_PHONE_NUMBER:
+            try:
+                call = twilio_client.calls.create(
+                    url=url_for('twilio_voice_webhook', _external=True, call_log_id=call_log.id),
+                    to=tech.mobile_phone,
+                    from_=TWILIO_PHONE_NUMBER
+                )
+                call_log.twilio_call_sid = call.sid
+                call_log.call_status = 'ringing'
+                db.session.commit()
+                
+                logger.info(f"Twilio call initiated. SID: {call.sid}")
+                
+            except Exception as e:
+                call_log.call_status = 'failed_twilio_api'
+                call_log.call_result = 'error'
+                call_log.ai_conversation = f"Twilio error: {str(e)}"
+                db.session.commit()
+                logger.error(f"Twilio call failed: {e}")
+                
+                return {
+                    'call_log_id': call_log.id,
+                    'technician_id': tech.id,
+                    'name': tech.name,
+                    'phone': tech.mobile_phone,
+                    'call_status': 'failed_twilio_api',
+                    'call_result': 'error',
+                    'error': str(e)
+                }
+        else:
+            # Simulate call for testing
+            call_log.call_status = 'simulated'
+            responses = ['interested', 'not_interested', 'callback', 'unavailable']
+            weights = [0.25, 0.45, 0.20, 0.10]
+            call_log.call_result = random.choices(responses, weights=weights)[0]
+            call_log.call_duration = random.randint(90, 240)
+            
+            if call_log.call_result == 'interested':
+                campaign.current_responses += 1
+            
+            db.session.commit()
+        
+        return {
+            'call_log_id': call_log.id,
+            'technician_id': tech.id,
+            'name': tech.name,
+            'phone': tech.mobile_phone,
+            'call_status': call_log.call_status,
+            'call_result': call_log.call_result or 'pending',
+            'distance': tech_data['distance'],
+            'twilio_call_sid': call_log.twilio_call_sid
+        }
+        
+    except Exception as e:
+        logger.error(f"Error making call to {tech.name}: {e}")
+        return {
+            'technician_id': tech.id,
+            'name': tech.name,
+            'phone': tech.mobile_phone,
+            'call_status': 'error',
+            'call_result': 'error',
+            'error': str(e)
+        }
+
 # ==================== ROUTES ====================
 
 @app.route('/')
@@ -418,170 +554,154 @@ def index():
 
 @app.route('/twilio_voice_webhook', methods=['GET', 'POST'])
 def twilio_voice_webhook():
-    """Fixed Twilio voice webhook with better error handling"""
     call_log_id = request.args.get('call_log_id')
     
-    try:
-        if request.method == 'GET':
-            # Initial call answer - provide TwiML
-            logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
-            
-            # Update call status to 'in-progress' if we have a call log ID
-            if call_log_id:
-                try:
-                    call_log = CallLog.query.get(call_log_id)
-                    if call_log:
-                        call_log.call_status = 'in-progress'
-                        db.session.commit()
-                except Exception as e:
-                    logger.error(f"Error updating call status: {e}")
-                    db.session.rollback()
-            
-            # Create response
-            response = TwiMLResponse()
-            say = Say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?",
-                     voice='woman', language='en-US')
-            response.append(say)
-            
-            gather = Gather(
-                input='speech',
-                speechTimeout='auto',
-                action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-                method='POST',
-                actionOnEmptyResult=True
-            )
-            response.append(gather)
-            
-            return str(response), 200, {'Content-Type': 'text/xml'}
-        
-        else:  # POST - status updates
-            call_sid = request.form.get('CallSid')
-            call_status = request.form.get('CallStatus')
-            logger.info(f"Status update: CallSid={call_sid}, Status={call_status}")
-            
-            # Update call log status
-            if call_log_id and call_status:
-                try:
-                    call_log = CallLog.query.get(call_log_id)
-                    if call_log:
-                        call_log.call_status = call_status
-                        if call_status == 'completed':
-                            call_log.call_duration = int(request.form.get('CallDuration', 0))
-                        db.session.commit()
-                except Exception as e:
-                    logger.error(f"Error updating call status: {e}")
-                    db.session.rollback()
-            
-            return '', 200
-    
-    except Exception as e:
-        logger.error(f"Error in twilio_voice_webhook: {e}")
-        # Fallback response if something goes wrong
+    if request.method == 'GET':
+        # Call answered - provide TwiML with OpenAI
+        logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
         response = TwiMLResponse()
-        response.say("Thank you for your time. Have a great day!", voice='woman')
-        response.hangup()
-        return str(response), 200, {'Content-Type': 'text/xml'}
+        
+        # Get context for AI
+        if call_log_id:
+            call_log = CallLog.query.get(call_log_id)
+            if call_log:
+                technician = Technician.query.get(call_log.technician_id)
+                campaign = CallCampaign.query.get(call_log.campaign_id)
+                work_order = campaign.work_order if campaign else None
+                
+                # Build AI prompt with context
+                initial_prompt = (
+                    "Introduce yourself as Sarah from Field Services Nationwide. "
+                    "You're calling about a job opportunity. Keep it brief and ask if they're available to chat. "
+                )
+                
+                if technician and work_order:
+                    required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
+                    initial_prompt += (
+                        f"The technician's name is {technician.name}. "
+                        f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
+                        f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
+                    )
+                
+                ai_response = call_openai_api(initial_prompt)
+                if not ai_response:
+                    ai_response = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?"
+                
+                call_log.ai_conversation = f"AI: {ai_response}"
+                db.session.commit()
+                
+                response.say(ai_response)
+            else:
+                response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
+        else:
+            response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?")
+        
+        response.gather(
+            input='speech',
+            speechTimeout='auto',
+            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+            method='POST',
+            actionOnEmptyResult=True
+        )
+        return str(response)
+    
+    else:  # POST - status updates
+        call_sid = request.form.get('CallSid')
+        call_status = request.form.get('CallStatus')
+        logger.info(f"Status update: CallSid={call_sid}, Status={call_status}")
+        
+        # Update call log status
+        if call_log_id and call_status in ['answered', 'completed', 'busy', 'no-answer', 'failed']:
+            try:
+                call_log = CallLog.query.get(call_log_id)
+                if call_log:
+                    call_log.call_status = call_status
+                    db.session.commit()
+            except Exception as e:
+                logger.error(f"Error updating call status: {e}")
+                db.session.rollback()
+        
+        return '', 200
 
 @app.route('/twilio_handle_response', methods=['POST'])
 def twilio_handle_response():
-    """Fixed response handler with better error handling"""
     call_sid = request.form.get('CallSid')
-    speech_result = request.form.get('SpeechResult', '').strip()
+    speech_result = request.form.get('SpeechResult', '')
     call_log_id = request.args.get('call_log_id')
     
     logger.info(f"Speech from {call_sid}: '{speech_result}'")
     
-    try:
-        response = TwiMLResponse()
-        
-        if not call_log_id:
-            raise ValueError("Missing call_log_id")
-        
-        # Get call log record
-        call_log = CallLog.query.get(call_log_id)
-        if not call_log:
-            raise ValueError(f"Call log not found for ID: {call_log_id}")
-        
-        # Update conversation history
-        conversation = call_log.ai_conversation or ""
-        conversation += f"\nTechnician: {speech_result}"
-        
-        # Generate AI response
-        ai_prompt = (
-            f"Continue this conversation as Sarah from Field Services Nationwide:\n{conversation}\n\n"
-            f"Based on their response, continue talking about the job opportunity. "
-            f"Keep responses under 20 seconds. If they seem interested, tell them a recruiter will call back. "
-            f"If not interested, politely end the call."
-        )
-        
-        try:
-            ai_response = call_gemini_api(ai_prompt) or "Thank you for your time. A recruiter will contact you soon if you're interested."
-        except Exception as e:
-            logger.error(f"AI API error: {e}")
-            ai_response = "Thank you for your time. A recruiter will contact you soon if you're interested."
-        
-        # Add AI response to conversation
-        conversation += f"\nAI: {ai_response}"
-        call_log.ai_conversation = conversation
-        
-        # Check if conversation should end
-        lower_response = ai_response.lower()
-        should_end = any(phrase in lower_response for phrase in [
-            "goodbye", "thank you", "recruiter will call", "not interested", "have a great day"
-        ])
-        
-        # Create response
-        say = Say(ai_response, voice='woman', language='en-US')
-        response.append(say)
-        
-        if should_end:
-            if "recruiter will call" in lower_response or "interested" in speech_result.lower():
-                call_log.call_result = 'interested'
-                # Update campaign responses
-                campaign = call_log.campaign
-                campaign.current_responses += 1
-            else:
-                call_log.call_result = 'not_interested'
-            
-            call_log.call_status = 'completed'
-            response.hangup()
-        else:
-            # Continue conversation
-            gather = Gather(
-                input='speech',
-                speechTimeout='auto',
-                action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-                method='POST',
-                actionOnEmptyResult=True
-            )
-            response.append(gather)
-        
-        # Save changes to database
-        db.session.commit()
-        
-        return str(response), 200, {'Content-Type': 'text/xml'}
+    response = TwiMLResponse()
     
+    try:
+        # Update conversation
+        if call_log_id:
+            call_log = CallLog.query.get(call_log_id)
+            if call_log:
+                conversation = call_log.ai_conversation or ""
+                conversation += f"\nTechnician: {speech_result}"
+                
+                # Get job context
+                campaign = call_log.campaign
+                work_order = campaign.work_order if campaign else None
+                job_info = ""
+                if work_order:
+                    job_info = f"Job: {work_order.job_category} in {work_order.job_city}, ${work_order.pay_rate}/hour"
+                
+                # Generate AI response using OpenAI
+                ai_prompt = (
+                    f"Continue this conversation as Sarah from Field Services Nationwide:\n{conversation}\n\n"
+                    f"Job details: {job_info}\n\n"
+                    f"Based on their response, continue talking about the job opportunity. "
+                    f"Keep responses under 20 seconds. If they seem interested, tell them a recruiter will call back. "
+                    f"If not interested, politely end the call. "
+                    f"If they need more info, provide job details briefly."
+                )
+                
+                ai_response = call_openai_api(ai_prompt)
+                if not ai_response:
+                    ai_response = "Thank you for your time. A recruiter will contact you soon if you're interested."
+                
+                response.say(ai_response)
+                
+                # Update conversation
+                conversation += f"\nAI: {ai_response}"
+                call_log.ai_conversation = conversation
+                
+                # Check if conversation should end
+                lower_response = ai_response.lower()
+                should_end = any(phrase in lower_response for phrase in [
+                    "goodbye", "thank you for your time", "recruiter will call", "not interested"
+                ])
+                
+                if should_end:
+                    if "recruiter will call" in lower_response or "interested" in speech_result.lower():
+                        call_log.call_result = 'interested'
+                        # Update campaign responses
+                        campaign.current_responses += 1
+                    else:
+                        call_log.call_result = 'not_interested'
+                    
+                    call_log.call_status = 'completed'
+                    response.hangup()
+                else:
+                    # Continue conversation
+                    response.gather(
+                        input='speech',
+                        speechTimeout='auto',
+                        action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+                        method='POST',
+                        actionOnEmptyResult=True
+                    )
+                
+                db.session.commit()
+        
     except Exception as e:
         logger.error(f"Error in handle_response: {e}")
-        # Fallback response
-        response = TwiMLResponse()
-        response.say("Thank you for your time. Have a great day!", voice='woman')
+        response.say("Thank you for your time. Have a great day!")
         response.hangup()
-        
-        # Try to update call log if we have the ID
-        if call_log_id:
-            try:
-                call_log = CallLog.query.get(call_log_id)
-                if call_log:
-                    call_log.call_status = 'failed'
-                    call_log.call_result = 'error'
-                    call_log.ai_conversation = f"{call_log.ai_conversation or ''}\nSYSTEM ERROR: {str(e)}"
-                    db.session.commit()
-            except Exception as db_error:
-                logger.error(f"Failed to update call log on error: {db_error}")
-                db.session.rollback()
-        
-        return str(response), 200, {'Content-Type': 'text/xml'}
+    
+    return str(response)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -873,7 +993,7 @@ def api_start_calling(campaign_id):
         random.shuffle(qualified_pool)
         selected_techs = qualified_pool[:batch_size]
         
-        # Make calls using call.py
+        # Make calls
         results = []
         successful_calls = 0
         
