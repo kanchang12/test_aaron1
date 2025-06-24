@@ -1,0 +1,16 @@
+Flask
+Flask-SQLAlchemy
+Flask-WTF
+Flask-Login
+Flask-Migrate
+gunicorn
+psycopg2-binary
+pandas
+geopy
+twilio
+openai
+requests
+python-dotenv
+werkzeug
+wtforms
+email-validator
