@@ -43,7 +43,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///fsn_calling.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['WTF_CSRF_ENABLED'] = True
+app.config['WTF_CSRF_ENABLED'] = False
 
 # Initialize extensions
 db = SQLAlchemy(app)
@@ -53,7 +53,7 @@ login_manager.init_app(app)
 login_manager.login_view = 'login'
 login_manager.login_message = 'Please log in to access this page.'
 login_manager.login_message_category = 'info'
-csrf = CSRFProtect(app)
+#csrf = CSRFProtect(app)
 
 # Configuration
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
@@ -575,14 +575,13 @@ def campaign_dashboard(campaign_id):
     }
     
     # Generate CSRF token for any AJAX calls on this page
-    csrf_token_value = generate_csrf()
+    #csrf_token_value = generate_csrf()
 
     return render_template('campaign/dashboard.html', 
                            campaign=campaign,
                            work_order=work_order,
                            call_logs=call_logs, # This will now be a list of (CallLog, Technician) tuples
-                           stats=stats,
-                           csrf_token_value=csrf_token_value) # Pass the token
+                           stats=stats
 
 @app.route('/upload_technicians', methods=['GET', 'POST'])
 @login_required
