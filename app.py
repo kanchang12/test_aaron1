@@ -877,9 +877,7 @@ def api_expand_radius(campaign_id):
         logger.error(f"API radius expansion failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-# REPLACE these TWO functions in your existing code:
-
-@app.route('/twilio_handle_response', methods=['POST'])
+@app.route('/twilio_handle_response', methods=['POST', 'GET'])
 def twilio_handle_response():
     call_sid = request.form.get('CallSid')
     speech_result = request.form.get('SpeechResult', '')
@@ -935,86 +933,6 @@ def twilio_handle_response():
         response.hangup()
     else:
         # CONTINUE THE CONVERSATION - this is the key part!
-        response.gather(
-            input='speech',
-            speechTimeout='auto',
-            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-            method='POST',
-            actionOnEmptyResult=True
-        )
-    
-    db.session.commit()
-    return str(response)
-
-@app.route('/twilio_handle_response', methods=['POST'])
-def twilio_handle_response():
-    call_sid = request.form.get('CallSid')
-    speech_result = request.form.get('SpeechResult')
-    
-    logger.info(f"Handling response for {call_sid}: '{speech_result}'")
-    
-    response = TwiMLResponse()
-    call_log_id = request.args.get('call_log_id')
-    call_log = CallLog.query.get(call_log_id) if call_log_id else None
-    
-    if not call_log:
-        response.say("Sorry, technical issue. Goodbye.")
-        response.hangup()
-        return str(response)
-    
-    # Update conversation
-    conversation = call_log.ai_conversation or ""
-    conversation += f"\nTechnician: {speech_result or '(no response)'}"
-    call_log.ai_conversation = conversation
-    
-    # Get context
-    technician = Technician.query.get(call_log.technician_id)
-    campaign = CallCampaign.query.get(call_log.campaign_id)
-    work_order = campaign.work_order if campaign else None
-    
-    # Build AI prompt for response
-    job_info = ""
-    if work_order:
-        job_info = f"Job: {work_order.job_category} in {work_order.job_city}, ${work_order.pay_rate}/hour"
-    
-    ai_prompt = (
-        f"You are Sarah from Field Services Nationwide. Continue this conversation:\n{conversation}\n\n"
-        f"Job details: {job_info}\n\n"
-        f"Based on their response, determine if they're interested, not interested, or need callback. "
-        f"If interested, say 'Great! A recruiter will call you soon.' and end. "
-        f"If not interested, say 'Thanks for your time. Goodbye.' and end. "
-        f"If they want callback, say 'I'll have someone call you back.' and end. "
-        f"Otherwise, provide more job details and ask again. Keep responses under 20 seconds."
-    )
-    
-    ai_response = call_gemini_api(ai_prompt)
-    if not ai_response:
-        ai_response = "Thanks for your time. A recruiter will follow up. Goodbye."
-    
-    response.say(ai_response)
-    conversation += f"\nAI: {ai_response}"
-    call_log.ai_conversation = conversation
-    
-    # Check if conversation should end
-    lower_response = ai_response.lower()
-    should_end = any(phrase in lower_response for phrase in [
-        "recruiter will call", "goodbye", "thanks for your time", "call you back"
-    ])
-    
-    if should_end:
-        # Set call result based on conversation
-        if "recruiter will call" in lower_response or "great!" in lower_response:
-            call_log.call_result = 'interested'
-            campaign.current_responses += 1
-        elif "call you back" in lower_response:
-            call_log.call_result = 'callback'
-        else:
-            call_log.call_result = 'not_interested'
-        
-        call_log.call_status = 'completed'
-        response.hangup()
-    else:
-        # Continue conversation
         response.gather(
             input='speech',
             speechTimeout='auto',
