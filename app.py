@@ -877,226 +877,148 @@ def api_expand_radius(campaign_id):
         logger.error(f"API radius expansion failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-# Twilio Voice Webhook: This will receive actual call events from Twilio
+# REPLACE these TWO functions in your existing code:
+
 @app.route('/twilio_voice_webhook', methods=['POST'])
 def twilio_voice_webhook():
-    """
-    This endpoint is now configured to receive real updates from Twilio during a call.
-    It will respond with TwiML (Twilio Markup Language) to instruct Twilio on
-    what to say or do during the call.
-    """
     call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus') # e.g., 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'in-progress'
-    # 'From' is your Twilio number, 'To' is the technician's number
-    from_number = request.form.get('From') 
-    to_number = request.form.get('To') 
+    call_status = request.form.get('CallStatus')
     
     logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}")
 
     response = TwiMLResponse()
     
-    # Retrieve call_log and related data using the call_log_id passed from make_ai_call
-    call_log_id = request.args.get('call_log_id')
-    call_log = CallLog.query.get(call_log_id) if call_log_id else None
-    technician = None
-    work_order = None
-    campaign = None
-
-    if call_log:
-        technician = Technician.query.get(call_log.technician_id)
-        campaign = CallCampaign.query.get(call_log.campaign_id)
-        if campaign:
-            work_order = WorkOrder.query.get(campaign.work_order_id)
-        
-        # Update call_log status based on Twilio webhook
-        call_log.call_status = call_status
-        
-        # If call completed and we haven't set a specific result from AI interaction, infer from Twilio status
-        if call_status == 'completed' and (call_log.call_result == 'pending_response' or call_log.call_result is None):
-            call_duration = request.form.get('CallDuration')
-            if call_status == 'completed' and call_duration and int(call_duration) > 0:
-                call_log.call_result = 'answered' # Was answered, but no specific AI outcome yet
-            elif call_status == 'no-answer':
-                call_log.call_result = 'no_answer'
-            elif call_status == 'busy':
-                call_log.call_result = 'busy'
-            elif call_status == 'failed':
-                call_log.call_result = 'failed'
-
-            call_log.call_duration = call_duration if call_duration else 0 # Store duration
-            
-        db.session.commit() # Save the latest status update
-
-    # --- LLM AI CONVERSATION LOGIC - Initial Turn ---
+    # Only handle 'answered' status with full AI logic
     if call_status == 'answered':
-        # Construct a comprehensive prompt for Gemini for its initial greeting
-        initial_prompt = (
-            "You are an AI job assistant named 'Sarah' from Field Services Nationwide. "
-            "Your main goal is to determine if a technician is interested in a new job opportunity "
-            "and available for a human recruiter to follow up. "
-            "Start by introducing yourself as Sarah from Field Services Nationwide. "
-            "Then, state that you are calling about a job opportunity and ask if the technician is available "
-            "for a brief discussion. Keep your initial response concise and professional. "
-        )
+        call_log_id = request.args.get('call_log_id')
+        call_log = CallLog.query.get(call_log_id) if call_log_id else None
         
-        # Add work order and technician context if available
-        if technician:
-            initial_prompt += f"The technician's name is {technician.name} (Phone: {technician.mobile_phone})."
-            if technician.skills:
-                initial_prompt += f" They have skills in: {', '.join(technician.skills.keys())}."
-            if technician.experience_years:
-                initial_prompt += f" They have {technician.experience_years} years of experience."
-        if work_order:
-            required_skills_str = ", ".join(work_order.required_skills) if work_order.required_skills else "various IT skills"
-            initial_prompt += (
-                f" The job is for a {work_order.job_category} role requiring skills in {required_skills_str} "
-                f"in {work_order.job_city}, {work_order.job_state} (ZIP: {work_order.job_zip}). "
-                f"The pay rate is ${work_order.pay_rate} per hour for approximately {work_order.duration_hours} hours. "
-                f"The tentative start date is {work_order.start_date.strftime('%Y-%m-%d') if work_order.start_date else 'a flexible date'}."
-            )
-            initial_prompt += " Be ready to ask about their availability and interest. Do not reveal the full job description unless they ask."
-
-        gemini_response_text = call_gemini_api(initial_prompt)
-        
-        if not gemini_response_text:
-            gemini_response_text = "I am sorry, I am unable to connect you to our AI at this moment."
-            
-        response.say(gemini_response_text)
-        
-        # Store AI's first message in conversation history
         if call_log:
-            call_log.ai_conversation = f"AI: {gemini_response_text}"
+            # Update call status
+            call_log.call_status = 'answered'
+            
+            # Get context for AI
+            technician = Technician.query.get(call_log.technician_id)
+            campaign = CallCampaign.query.get(call_log.campaign_id)
+            work_order = campaign.work_order if campaign else None
+            
+            # Build AI prompt with context
+            initial_prompt = (
+                "You are Sarah, an AI assistant from Field Services Nationwide. "
+                "Introduce yourself and explain you're calling about a job opportunity. "
+                "Keep it brief and ask if they're available to chat. "
+            )
+            
+            if technician and work_order:
+                required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
+                initial_prompt += (
+                    f"The technician's name is {technician.name}. "
+                    f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
+                    f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
+                )
+            
+            # Get AI response
+            ai_response = call_gemini_api(initial_prompt)
+            if not ai_response:
+                ai_response = f"Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat briefly?"
+            
+            # Save conversation
+            call_log.ai_conversation = f"AI: {ai_response}"
             db.session.commit()
-
-        # Begin multi-turn conversation with <Gather>
-        # This tells Twilio to listen for speech (or DTMF tones) from the user,
-        # transcribe it, and send it to the 'twilio_handle_response' endpoint.
-        # Added actionOnEmptyResult=True to ensure webhook is sent even if no speech is detected after timeout
-        response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
-                                                                               call_log_id=call_log_id), # Pass call_log_id
-                         method='POST', actionOnEmptyResult=True) 
+            
+            response.say(ai_response)
+        else:
+            response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
         
-        logger.info(f"TwiML generated for CallSid {call_sid}: Spoke Gemini response and started gathering input.")
-        
-    elif call_status == 'ringing':
-        logger.info(f"CallSid {call_sid} is ringing. No TwiML generated yet.")
-        pass # Twilio will continue ringing until answered or timeouts
-    elif call_status in ['busy', 'no-answer', 'failed', 'completed']:
-        logger.info(f"CallSid {call_sid} ended with status: {call_status}. CallLog updated.")
-        # The CallLog status and result are already updated at the top of the webhook.
-        # No further TwiML needed for these terminal statuses.
-    elif call_status == 'in-progress': # Explicitly handle 'in-progress' status
-        logger.info(f"CallSid {call_sid} is in progress. No new TwiML required at this stage.")
-        pass # No TwiML response is typically needed for 'in-progress'
-    else:
-        logger.warning(f"Webhook received unexpected CallStatus '{call_status}' for CallSid: {call_sid}. No TwiML generated.")
-        
+        # Start conversation
+        response.gather(
+            input='speech', 
+            speechTimeout='auto', 
+            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+            method='POST',
+            actionOnEmptyResult=True
+        )
+    
     return str(response)
 
-# Endpoint for Multi-turn Conversation after initial <Gather>
 @app.route('/twilio_handle_response', methods=['POST'])
 def twilio_handle_response():
-    """
-    This endpoint processes the technician's response (speech/digits)
-    collected by a previous <Gather> verb, sends it to Gemini for the next turn,
-    and generates new TwiML.
-    """
     call_sid = request.form.get('CallSid')
-    speech_result = request.form.get('SpeechResult') # Transcribed speech from technician
+    speech_result = request.form.get('SpeechResult')
     
-    if speech_result:
-        logger.info(f"Handling Twilio response for CallSid {call_sid}. Technician's speech: '{speech_result}'")
-    else:
-        logger.info(f"Handling Twilio response for CallSid {call_sid}. No speech detected (SpeechResult empty).")
-        # You might want to have the AI prompt again here if no speech, or hang up after a few tries.
-
+    logger.info(f"Handling response for {call_sid}: '{speech_result}'")
+    
     response = TwiMLResponse()
-    call_log_id = request.args.get('call_log_id') # Retrieve call_log_id from URL args
+    call_log_id = request.args.get('call_log_id')
     call_log = CallLog.query.get(call_log_id) if call_log_id else None
-
+    
     if not call_log:
-        logger.error(f"CallLog not found for CallSid: {call_sid} or call_log_id: {call_log_id}. Ending call.")
-        response.say("I am sorry, there was a problem with our connection. Goodbye.")
+        response.say("Sorry, technical issue. Goodbye.")
         response.hangup()
         return str(response)
-
-    # Append technician's speech to conversation history
-    conversation_history = call_log.ai_conversation if call_log.ai_conversation else ""
-    if speech_result: # Only append if speech was detected
-        conversation_history += f"\nTechnician: {speech_result}"
-    else:
-        conversation_history += "\nTechnician: (Silence/Unclear Speech Detected)" # Log silence/unclear speech
-        
-    call_log.ai_conversation = conversation_history
-    db.session.commit() # Save updated history
-
+    
+    # Update conversation
+    conversation = call_log.ai_conversation or ""
+    conversation += f"\nTechnician: {speech_result or '(no response)'}"
+    call_log.ai_conversation = conversation
+    
+    # Get context
     technician = Technician.query.get(call_log.technician_id)
-    work_order = WorkOrder.query.get(call_log.campaign.work_order_id)
-
-    # Craft a dynamic prompt for Gemini for the next turn
+    campaign = CallCampaign.query.get(call_log.campaign_id)
+    work_order = campaign.work_order if campaign else None
+    
+    # Build AI prompt for response
     job_info = ""
     if work_order:
-        required_skills_str = ", ".join(work_order.required_skills) if work_order.required_skills else "various IT skills"
-        job_info = (
-            f"The job is a {work_order.job_category} role in {work_order.job_city}, {work_order.job_state} "
-            f"paying ${work_order.pay_rate} per hour for approximately {work_order.duration_hours} hours. "
-            f"It tentatively starts on {work_order.start_date.strftime('%Y-%m-%d') if work_order.start_date else 'a flexible date'}. "
-            f"Required skills: {required_skills_str}."
-        )
+        job_info = f"Job: {work_order.job_category} in {work_order.job_city}, ${work_order.pay_rate}/hour"
     
-    # Instruct Gemini on its persona and goals for this turn
-    gemini_prompt = (
-        f"You are an AI job assistant named 'Sarah' from Field Services Nationwide. "
-        f"Your current conversation history is: \n{conversation_history}\n" # Pass the full history
-        f"The job opportunity is: {job_info}\n\n"
-        f"Based on the technician's last response, continue the conversation. "
-        f"Your goal is to ascertain their interest ('interested', 'not interested', 'callback', 'unavailable'). "
-        f"You need to ask about their availability for the job and for a human recruiter call. "
-        f"Be polite, concise, and guide the conversation towards determining their interest or availability. "
-        f"If they express clear interest, generate a concluding remark like 'Great! I'll make a note for a human recruiter to call you shortly.' "
-        f"If they say they're not interested, generate a concluding remark like 'Okay, thank you for your time. Goodbye.' "
-        f"If they ask for a callback, say 'Understood, I will inform the recruiter to call you back soon.' "
-        f"If they are clearly unavailable now but not rejecting the job, acknowledge it and suggest a follow-up. "
-        f"Always end your response if they express definitive interest or disinterest."
+    ai_prompt = (
+        f"You are Sarah from Field Services Nationwide. Continue this conversation:\n{conversation}\n\n"
+        f"Job details: {job_info}\n\n"
+        f"Based on their response, determine if they're interested, not interested, or need callback. "
+        f"If interested, say 'Great! A recruiter will call you soon.' and end. "
+        f"If not interested, say 'Thanks for your time. Goodbye.' and end. "
+        f"If they want callback, say 'I'll have someone call you back.' and end. "
+        f"Otherwise, provide more job details and ask again. Keep responses under 20 seconds."
     )
     
-    next_ai_response = call_gemini_api(gemini_prompt)
+    ai_response = call_gemini_api(ai_prompt)
+    if not ai_response:
+        ai_response = "Thanks for your time. A recruiter will follow up. Goodbye."
     
-    if not next_ai_response:
-        next_ai_response = "I am sorry, I am experiencing a temporary issue. Can you please repeat that?"
+    response.say(ai_response)
+    conversation += f"\nAI: {ai_response}"
+    call_log.ai_conversation = conversation
+    
+    # Check if conversation should end
+    lower_response = ai_response.lower()
+    should_end = any(phrase in lower_response for phrase in [
+        "recruiter will call", "goodbye", "thanks for your time", "call you back"
+    ])
+    
+    if should_end:
+        # Set call result based on conversation
+        if "recruiter will call" in lower_response or "great!" in lower_response:
+            call_log.call_result = 'interested'
+            campaign.current_responses += 1
+        elif "call you back" in lower_response:
+            call_log.call_result = 'callback'
+        else:
+            call_log.call_result = 'not_interested'
         
-    response.say(next_ai_response)
-    
-    # Update AI conversation in log with Gemini's response
-    call_log.ai_conversation += f"\nAI: {next_ai_response}"
-    
-    # Analyze AI's response to determine if call should end or continue
-    lower_response = next_ai_response.lower()
-    if "great! i'll make a note for a human recruiter" in lower_response or "excellent! a recruiter will reach out" in lower_response:
-        call_log.call_result = 'interested'
-        call_log.call_status = 'completed'
-        response.hangup()
-    elif "thank you for your time. goodbye" in lower_response or "i understand, we'll close this opportunity" in lower_response:
-        call_log.call_result = 'not_interested'
-        call_log.call_status = 'completed'
-        response.hangup()
-    elif "i will inform the recruiter to call you back soon" in lower_response:
-        call_log.call_result = 'callback'
-        call_log.call_status = 'completed'
-        response.hangup()
-    elif "i understand you're unavailable now" in lower_response or "perhaps another time" in lower_response:
-        # If AI indicates understanding of current unavailability but no outright rejection
-        call_log.call_result = 'unavailable'
         call_log.call_status = 'completed'
         response.hangup()
     else:
-        # Continue gathering for next turn if no clear end signal from AI
-        response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
-                                                                               call_log_id=call_log_id),
-                         method='POST', actionOnEmptyResult=True) # Also add for subsequent gathers
+        # Continue conversation
+        response.gather(
+            input='speech',
+            speechTimeout='auto',
+            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+            method='POST',
+            actionOnEmptyResult=True
+        )
     
-    db.session.commit() # Save final call result or updated conversation
-    logger.info(f"Generated next TwiML for CallSid {call_sid}. Current Call Result: {call_log.call_result}")
+    db.session.commit()
     return str(response)
 
 
