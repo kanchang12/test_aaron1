@@ -125,7 +125,7 @@
             const callLogsTableBody = document.getElementById('callLogsTableBody');
 
             // Pass the CSRF token from Flask to JavaScript
-            const csrfToken = "{{ csrf_token_value }}";
+
             const campaignId = "{{ campaign.id }}";
 
             // Function to update campaign dashboard stats and call logs
@@ -191,8 +191,8 @@
                     const response = await fetch(`/api/start_calling/${campaignId}`, {
                         method: 'POST',
                         headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRFToken': csrfToken
+                            'Content-Type': 'application/json'
+                
                         },
                         body: JSON.stringify({ batch_size: 5 }) // Call 5 technicians at a time
                     });
@@ -226,8 +226,8 @@
                     const response = await fetch(`/api/expand_radius/${campaignId}`, {
                         method: 'POST',
                         headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRFToken': csrfToken
+                            'Content-Type': 'application/json'
+                            
                         },
                         body: JSON.stringify({ expansion_miles: 20 })
                     });
