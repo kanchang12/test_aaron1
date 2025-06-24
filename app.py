@@ -167,6 +167,7 @@ class CallLog(db.Model):
     call_status = db.Column(db.String(20), nullable=False, index=True) # e.g., 'calling', 'answered', 'failed'
     call_result = db.Column(db.String(20), index=True) # e.g., 'interested', 'not_interested', 'callback', 'unavailable'
     call_duration = db.Column(db.Integer)
+    distance_miles = db.Column(db.Float)
     ai_conversation = db.Column(db.Text)
     twilio_call_sid = db.Column(db.String(100))
     called_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -438,9 +439,11 @@ def make_ai_call(campaign, tech_data):
         campaign_id=campaign.id,
         technician_id=tech.id,
         phone_number=tech.mobile_phone,
-        distance_miles=tech_data['distance'],
         call_status='initiated' # Initial status: call is being initiated
     )
+    # Assign distance_miles after instantiation to bypass potential constructor issue
+    call_log.distance_miles = tech_data['distance'] 
+
     db.session.add(call_log)
     db.session.commit() # Commit to get call_log.id before potential errors or Twilio call
 
@@ -1249,4 +1252,3 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     # In production, debug=False is crucial. Render handles the serving.
     app.run(host='0.0.0.0', port=port, debug=False)
-
