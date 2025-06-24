@@ -923,72 +923,7 @@ def api_expand_radius(campaign_id):
         logger.error(f"API radius expansion failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-@app.route('/twilio_handle_response', methods=['POST', 'GET'])
-def twilio_handle_response():
-    call_sid = request.form.get('CallSid')
-    speech_result = request.form.get('SpeechResult', '')
-    
-    logger.info(f"Handling response for {call_sid}: '{speech_result}'")
-    
-    response = TwiMLResponse()
-    call_log_id = request.args.get('call_log_id')
-    call_log = CallLog.query.get(call_log_id) if call_log_id else None
-    
-    if not call_log:
-        response.say("Sorry, technical issue. Goodbye.")
-        response.hangup()
-        return str(response)
-    
-    # Update conversation history
-    conversation = call_log.ai_conversation or ""
-    conversation += f"\nTechnician: {speech_result}"
-    call_log.ai_conversation = conversation
-    
-    # Get AI response
-    ai_prompt = (
-        f"Continue this conversation as Sarah from Field Services Nationwide:\n{conversation}\n\n"
-        f"Based on their response, continue talking about the job opportunity. "
-        f"Only end the conversation if they clearly say 'not interested', 'goodbye', or 'yes I'm interested'. "
-        f"Otherwise, keep the conversation going by asking questions about their availability, skills, or providing more job details. "
-        f"Keep responses under 20 seconds."
-    )
-    
-    ai_response = call_gemini_api(ai_prompt)
-    if not ai_response:
-        ai_response = "Can you tell me more about your availability for this job opportunity?"
-    
-    response.say(ai_response)
-    
-    # Update conversation
-    conversation += f"\nAI: {ai_response}"
-    call_log.ai_conversation = conversation
-    
-    # Check if AI explicitly ended conversation
-    lower_response = ai_response.lower()
-    should_end = any(phrase in lower_response for phrase in [
-        "goodbye", "thank you for your time", "recruiter will call you", "not a good fit"
-    ])
-    
-    if should_end:
-        # Set appropriate call result
-        if "recruiter will call" in lower_response:
-            call_log.call_result = 'interested'
-        else:
-            call_log.call_result = 'not_interested'
-        call_log.call_status = 'completed'
-        response.hangup()
-    else:
-        # CONTINUE THE CONVERSATION - this is the key part!
-        response.gather(
-            input='speech',
-            speechTimeout='auto',
-            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-            method='POST',
-            actionOnEmptyResult=True
-        )
-    
-    db.session.commit()
-    return str(response)
+
 
 
 # ==================== HELPER FUNCTIONS ====================
