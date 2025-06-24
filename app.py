@@ -581,7 +581,7 @@ def campaign_dashboard(campaign_id):
                            campaign=campaign,
                            work_order=work_order,
                            call_logs=call_logs, # This will now be a list of (CallLog, Technician) tuples
-                           stats=stats
+                           stats=stats)
 
 @app.route('/upload_technicians', methods=['GET', 'POST'])
 @login_required
