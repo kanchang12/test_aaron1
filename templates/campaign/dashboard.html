@@ -163,8 +163,7 @@ function campaignDashboard() {
                 const response = await fetch(`/api/start_calling/{{ campaign.id }}`, {
                     method: 'POST',
                     headers: { 
-                        'Content-Type': 'application/json',
-                        'X-CSRFToken': '{{ csrf_token() }}'
+                        'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({ batch_size: 10 })
                 });
@@ -193,7 +192,6 @@ function campaignDashboard() {
                     method: 'POST',
                     headers: { 
                         'Content-Type': 'application/json',
-                        'X-CSRFToken': '{{ csrf_token() }}'
                     },
                     body: JSON.stringify({ expansion_miles: 20 })
                 });
