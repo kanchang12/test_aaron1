@@ -712,7 +712,8 @@ def health_check():
 
 if __name__ == '__main__':
     with app.app_context():
-        create_admin_user()
-    
+        # db.create_all() # COMMENT OUT or REMOVE THIS LINE
+        create_admin_user() # Keep this, but ensure it's idempotent as discussed previously
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
