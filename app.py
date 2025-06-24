@@ -879,66 +879,71 @@ def api_expand_radius(campaign_id):
 
 # REPLACE these TWO functions in your existing code:
 
-@app.route('/twilio_voice_webhook', methods=['POST'])
-def twilio_voice_webhook():
+@app.route('/twilio_handle_response', methods=['POST'])
+def twilio_handle_response():
     call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus')
+    speech_result = request.form.get('SpeechResult', '')
     
-    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}")
-
+    logger.info(f"Handling response for {call_sid}: '{speech_result}'")
+    
     response = TwiMLResponse()
+    call_log_id = request.args.get('call_log_id')
+    call_log = CallLog.query.get(call_log_id) if call_log_id else None
     
-    # Only handle 'answered' status with full AI logic
-    if call_status == 'answered':
-        call_log_id = request.args.get('call_log_id')
-        call_log = CallLog.query.get(call_log_id) if call_log_id else None
-        
-        if call_log:
-            # Update call status
-            call_log.call_status = 'answered'
-            
-            # Get context for AI
-            technician = Technician.query.get(call_log.technician_id)
-            campaign = CallCampaign.query.get(call_log.campaign_id)
-            work_order = campaign.work_order if campaign else None
-            
-            # Build AI prompt with context
-            initial_prompt = (
-                "You are Sarah, an AI assistant from Field Services Nationwide. "
-                "Introduce yourself and explain you're calling about a job opportunity. "
-                "Keep it brief and ask if they're available to chat. "
-            )
-            
-            if technician and work_order:
-                required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
-                initial_prompt += (
-                    f"The technician's name is {technician.name}. "
-                    f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
-                    f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
-                )
-            
-            # Get AI response
-            ai_response = call_gemini_api(initial_prompt)
-            if not ai_response:
-                ai_response = f"Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat briefly?"
-            
-            # Save conversation
-            call_log.ai_conversation = f"AI: {ai_response}"
-            db.session.commit()
-            
-            response.say(ai_response)
+    if not call_log:
+        response.say("Sorry, technical issue. Goodbye.")
+        response.hangup()
+        return str(response)
+    
+    # Update conversation history
+    conversation = call_log.ai_conversation or ""
+    conversation += f"\nTechnician: {speech_result}"
+    call_log.ai_conversation = conversation
+    
+    # Get AI response
+    ai_prompt = (
+        f"Continue this conversation as Sarah from Field Services Nationwide:\n{conversation}\n\n"
+        f"Based on their response, continue talking about the job opportunity. "
+        f"Only end the conversation if they clearly say 'not interested', 'goodbye', or 'yes I'm interested'. "
+        f"Otherwise, keep the conversation going by asking questions about their availability, skills, or providing more job details. "
+        f"Keep responses under 20 seconds."
+    )
+    
+    ai_response = call_gemini_api(ai_prompt)
+    if not ai_response:
+        ai_response = "Can you tell me more about your availability for this job opportunity?"
+    
+    response.say(ai_response)
+    
+    # Update conversation
+    conversation += f"\nAI: {ai_response}"
+    call_log.ai_conversation = conversation
+    
+    # Check if AI explicitly ended conversation
+    lower_response = ai_response.lower()
+    should_end = any(phrase in lower_response for phrase in [
+        "goodbye", "thank you for your time", "recruiter will call you", "not a good fit"
+    ])
+    
+    if should_end:
+        # Set appropriate call result
+        if "recruiter will call" in lower_response:
+            call_log.call_result = 'interested'
         else:
-            response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
-        
-        # Start conversation
+            call_log.call_result = 'not_interested'
+        call_log.call_status = 'completed'
+        response.hangup()
+    else:
+        # CONTINUE THE CONVERSATION - this is the key part!
         response.gather(
-            input='speech', 
-            speechTimeout='auto', 
+            input='speech',
+            speechTimeout='auto',
             action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
             method='POST',
             actionOnEmptyResult=True
         )
     
+    db.session.commit()
     return str(response)
 
 @app.route('/twilio_handle_response', methods=['POST'])
