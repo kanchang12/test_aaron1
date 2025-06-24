@@ -249,7 +249,7 @@ def call_gemini_api(prompt, model="gemini-2.0-flash"):
         return "I am sorry, there was a problem with the AI service."
 
 def get_coordinates(address_string):
-    """Fixed geocoding function with better address formatting."""
+    """Fixed geocoding function that forces US locations only."""
     try:
         if not address_string or pd.isna(address_string):
             return None, None
@@ -257,17 +257,25 @@ def get_coordinates(address_string):
         # Clean the address string
         address_string = str(address_string).strip()
         
-        # If it's just a zip code, add country for better results
-        if address_string.replace('.', '').isdigit():
-            address_string = f"{address_string}, USA"
+        # FORCE US-ONLY by adding country code
+        if ", USA" not in address_string and ", US" not in address_string:
+            if address_string.replace('.', '').isdigit():
+                # Just a zip code
+                address_string = f"{address_string}, USA"
+            else:
+                # City/address - add USA
+                address_string = f"{address_string}, USA"
         
-        location = geolocator.geocode(address_string, timeout=10)
+        # Use countrycodes parameter to restrict to US only
+        location = geolocator.geocode(address_string, timeout=10, country_codes=['US'])
+        
         if location:
             logger.info(f"Geocoded '{address_string}': Lat {location.latitude}, Lon {location.longitude}")
             return location.latitude, location.longitude
         
-        logger.warning(f"Could not geocode: '{address_string}'")
+        logger.warning(f"Could not geocode US location: '{address_string}'")
         return None, None
+        
     except Exception as e:
         logger.error(f"Error geocoding '{address_string}': {e}")
         return None, None
