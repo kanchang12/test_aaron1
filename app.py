@@ -29,9 +29,6 @@ from wtforms import StringField, PasswordField, SelectField, TextAreaField, Inte
 from wtforms.validators import DataRequired, Email, Length, EqualTo, NumberRange
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Import calling functions
-from call import call_openai_api, make_ai_call
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -173,6 +170,9 @@ class CallLog(db.Model):
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+# Import calling functions from call.py
+from call import call_openai_api, make_ai_call
 
 # ==================== FORMS ====================
 
@@ -829,7 +829,7 @@ def api_start_calling(campaign_id):
         random.shuffle(qualified_pool)
         selected_techs = qualified_pool[:batch_size]
         
-        # Make calls
+        # Make calls using call.py
         results = []
         successful_calls = 0
         
