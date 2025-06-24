@@ -82,6 +82,7 @@ def call_openai_api(prompt, model="gpt-4o-mini"):
 # ==================== CALLING FUNCTIONS ====================
 
 def make_ai_call(phone_number, job_info):
+    """Make AI call - handles both simple job_info dict and database objects."""
     """Make AI call - generates AI response first, then makes call with TwiML."""
     
     logger.info(f"Making call to {phone_number}")
@@ -186,6 +187,7 @@ def api_make_call():
         if not phone_number:
             return jsonify({'success': False, 'error': 'Phone number required'}), 400
         
+        # Call with phone number and job info (simple mode)
         result = make_ai_call(phone_number, job_info)
         return jsonify(result)
         
