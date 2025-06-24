@@ -886,7 +886,7 @@ def twilio_voice_webhook():
     what to say or do during the call.
     """
     call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus') # e.g., 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'failed'
+    call_status = request.form.get('CallStatus') # e.g., 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'failed', 'in-progress'
     # 'From' is your Twilio number, 'To' is the technician's number
     from_number = request.form.get('From') 
     to_number = request.form.get('To') 
@@ -971,9 +971,10 @@ def twilio_voice_webhook():
         # Begin multi-turn conversation with <Gather>
         # This tells Twilio to listen for speech (or DTMF tones) from the user,
         # transcribe it, and send it to the 'twilio_handle_response' endpoint.
+        # Added actionOnEmptyResult=True to ensure webhook is sent even if no speech is detected after timeout
         response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
                                                                                call_log_id=call_log_id), # Pass call_log_id
-                         method='POST')
+                         method='POST', actionOnEmptyResult=True) 
         
         logger.info(f"TwiML generated for CallSid {call_sid}: Spoke Gemini response and started gathering input.")
         
@@ -1003,8 +1004,12 @@ def twilio_handle_response():
     call_sid = request.form.get('CallSid')
     speech_result = request.form.get('SpeechResult') # Transcribed speech from technician
     
-    logger.info(f"Handling Twilio response for CallSid {call_sid}. Technician's speech: '{speech_result}'")
-    
+    if speech_result:
+        logger.info(f"Handling Twilio response for CallSid {call_sid}. Technician's speech: '{speech_result}'")
+    else:
+        logger.info(f"Handling Twilio response for CallSid {call_sid}. No speech detected (SpeechResult empty).")
+        # You might want to have the AI prompt again here if no speech, or hang up after a few tries.
+
     response = TwiMLResponse()
     call_log_id = request.args.get('call_log_id') # Retrieve call_log_id from URL args
     call_log = CallLog.query.get(call_log_id) if call_log_id else None
@@ -1017,7 +1022,11 @@ def twilio_handle_response():
 
     # Append technician's speech to conversation history
     conversation_history = call_log.ai_conversation if call_log.ai_conversation else ""
-    conversation_history += f"\nTechnician: {speech_result}"
+    if speech_result: # Only append if speech was detected
+        conversation_history += f"\nTechnician: {speech_result}"
+    else:
+        conversation_history += "\nTechnician: (Silence/Unclear Speech Detected)" # Log silence/unclear speech
+        
     call_log.ai_conversation = conversation_history
     db.session.commit() # Save updated history
 
@@ -1038,7 +1047,7 @@ def twilio_handle_response():
     # Instruct Gemini on its persona and goals for this turn
     gemini_prompt = (
         f"You are an AI job assistant named 'Sarah' from Field Services Nationwide. "
-        f"Your current conversation history is: \n{conversation_history}\n"
+        f"Your current conversation history is: \n{conversation_history}\n" # Pass the full history
         f"The job opportunity is: {job_info}\n\n"
         f"Based on the technician's last response, continue the conversation. "
         f"Your goal is to ascertain their interest ('interested', 'not interested', 'callback', 'unavailable'). "
@@ -1084,7 +1093,7 @@ def twilio_handle_response():
         # Continue gathering for next turn if no clear end signal from AI
         response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
                                                                                call_log_id=call_log_id),
-                         method='POST')
+                         method='POST', actionOnEmptyResult=True) # Also add for subsequent gathers
     
     db.session.commit() # Save final call result or updated conversation
     logger.info(f"Generated next TwiML for CallSid {call_sid}. Current Call Result: {call_log.call_result}")
