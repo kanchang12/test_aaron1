@@ -14,3 +14,4 @@ python-dotenv
 werkzeug
 wtforms
 email-validator
+openpyxl
