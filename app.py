@@ -984,6 +984,9 @@ def twilio_voice_webhook():
         logger.info(f"CallSid {call_sid} ended with status: {call_status}. CallLog updated.")
         # The CallLog status and result are already updated at the top of the webhook.
         # No further TwiML needed for these terminal statuses.
+    elif call_status == 'in-progress': # Explicitly handle 'in-progress' status
+        logger.info(f"CallSid {call_sid} is in progress. No new TwiML required at this stage.")
+        pass # No TwiML response is typically needed for 'in-progress'
     else:
         logger.warning(f"Webhook received unexpected CallStatus '{call_status}' for CallSid: {call_sid}. No TwiML generated.")
         
