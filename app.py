@@ -14,46 +14,38 @@ from dotenv import load_dotenv
 import pandas as pd
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
-from twilio.rest import Client # <-- Make sure this line is present and NOT commented out
-from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse # <-- Also ensure this is present if you use TwiMLResponse
+# Ensure Twilio Client is imported and not commented out
+from twilio.rest import Client 
+from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse 
 import requests
-import sqlalchemy # <-- This was added recently for the SQL executor
+import sqlalchemy # Added for explicit SQL query executor support
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_wtf import FlaskForm, CSRFProtect
+from flask_wtf import FlaskForm # Keep FlaskForm if your forms inherit from it
+from flask_wtf.csrf import CSRFProtect, generate_csrf # Keep CSRFProtect if you want it enabled
 from flask_migrate import Migrate
-from flask_wtf.csrf import generate_csrf
 from wtforms import StringField, PasswordField, SelectField, TextAreaField, IntegerField, FloatField, BooleanField
 from wtforms.validators import DataRequired, Email, Length, EqualTo, NumberRange
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# ... rest of your app.py code ...
+# Configure logging: Set to DEBUG for very detailed logs for troubleshooting, INFO for general
+# For debugging "no eligible technicians", set this to logging.DEBUG
+logging.basicConfig(level=logging.INFO) # <<< CHANGE THIS TO logging.DEBUG FOR DETAILED QUALIFICATION LOGS
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///fsn_calling.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['WTF_CSRF_ENABLED'] = False
-
-# Initialize extensions
-db = SQLAlchemy(app)
-migrate = Migrate(app, db)
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = 'login'
-login_manager.login_message = 'Please log in to access this page.'
-login_manager.login_message_category = 'info'
-#csrf = CSRFProtect(app)
+app.config['WTF_CSRF_ENABLED'] = False # Keep this True if you want Flask-WTF forms to use CSRF
+# Manually remove CSRFProtect if you want no CSRF protection at all
+#csrf = CSRFProtect(app) 
 
 # Configuration
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
@@ -62,6 +54,7 @@ TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
 
 # Initialize clients (handle cases where Twilio SID might be missing)
+# Ensure Twilio Client is correctly initialized AFTER its import
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 geolocator = Nominatim(user_agent="fsn_calling_system")
 
@@ -230,94 +223,172 @@ def get_coordinates(zip_code):
     try:
         # Handle NaN or non-string inputs from pandas
         if pd.isna(zip_code) or not isinstance(zip_code, str):
+            logger.warning(f"Invalid zip code input for geocoding: '{zip_code}'. Returning None, None.")
             return None, None
         
-        location = geolocator.geocode(zip_code, timeout=5) # Add timeout for robustness
+        # Increased timeout for robustness
+        location = geolocator.geocode(zip_code, timeout=10)
         if location:
+            logger.info(f"Geocoded zip '{zip_code}': Lat {location.latitude}, Lon {location.longitude}")
             return location.latitude, location.longitude
+        logger.warning(f"Could not geocode zip code: '{zip_code}'. Returning None, None.")
         return None, None
     except Exception as e:
-        logger.error(f"Error getting coordinates for {zip_code}: {e}")
+        logger.error(f"Error getting coordinates for '{zip_code}': {e}", exc_info=True)
         return None, None
 
 def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None):
     if exclude_called_ids is None:
         exclude_called_ids = []
     
-    query = Technician.query.filter(Technician.is_active == True)
+    logger.info(f"--- Starting qualification check for Work Order: {work_order.work_order_id} (ID: {work_order.id}) ---")
+    logger.info(f"Work Order Location: Lat={work_order.job_latitude}, Lon={work_order.job_longitude}, Radius={radius_miles} miles")
     
-    if exclude_called_ids:
-        query = query.filter(~Technician.id.in_(exclude_called_ids))
+    potential_technicians_data = [] # To store details for the dashboard
     
-    all_techs = query.all()
+    # Fetch all active technicians
+    all_techs = Technician.query.filter(Technician.is_active == True).all()
+    
+    if not all_techs:
+        logger.warning("No active technicians found in the database.")
+        return [], [] # Return empty qualified list and empty potential_technicians_data
+
     qualified_pool = []
     
-    # Ensure work_order has coordinates for distance calculation
+    work_order_location = (work_order.job_latitude, work_order.job_longitude)
+    
+    # Check if work order has valid coordinates
     if not work_order.job_latitude or not work_order.job_longitude:
-        logger.warning(f"Work Order {work_order.work_order_id} has no coordinates. Cannot find technicians by distance.")
-        return []
-
+        logger.error(f"Work Order {work_order.work_order_id} has no valid coordinates. Cannot perform distance filtering.")
+        # All technicians will be disqualified by distance if work order location is bad
+    
     for tech in all_techs:
-        if not tech.latitude or not tech.longitude:
-            continue
-            
-        distance = geodesic(
-            (work_order.job_latitude, work_order.job_longitude),
-            (tech.latitude, tech.longitude)
-        ).miles
-            
-        if distance > radius_miles:
-            continue
-            
-        # Check requirements
-        reqs = work_order.requirements or {}
-        if reqs.get('drug_screen', False) and not tech.drug_screening:
-            continue
-        if reqs.get('background_check', False) and not tech.background_check:
-            continue
-            
-        # Check minimum experience
-        min_exp = reqs.get('min_experience', 0)
-        if tech.experience_years is None or tech.experience_years < min_exp:
-            continue
+        is_qualified = True
+        disqualification_reason = []
+        tech_distance = None
 
-        # Check skills
-        if work_order.required_skills:
+        logger.debug(f"Checking Technician: {tech.name} (ID: {tech.id}, Phone: {tech.mobile_phone})")
+        
+        # 1. Check if already called in this campaign
+        if tech.id in exclude_called_ids:
+            is_qualified = False
+            disqualification_reason.append("Already called for this campaign")
+            logger.debug(f"- {tech.name}: Skipped (Already called for this campaign)")
+        
+        # 2. Check location and distance (only if not already disqualified)
+        if is_qualified:
+            tech_location = (tech.latitude, tech.longitude)
+            if not tech.latitude or not tech.longitude:
+                is_qualified = False
+                disqualification_reason.append("No valid coordinates")
+                logger.debug(f"- {tech.name}: Skipped (No valid technician coordinates: Lat={tech.latitude}, Lon={tech.longitude})")
+            elif not work_order.job_latitude or not work_order.job_longitude:
+                 # This case is handled above, but as a secondary check for each tech
+                is_qualified = False
+                disqualification_reason.append("Work Order has no valid coordinates for distance check")
+                logger.debug(f"- {tech.name}: Skipped (Work Order has no valid coordinates for distance check)")
+            else:
+                try:
+                    tech_distance = geodesic(work_order_location, tech_location).miles
+                    logger.debug(f"- {tech.name}: Distance calculated: {tech_distance:.2f} miles (Radius: {radius_miles})")
+                    if tech_distance > radius_miles:
+                        is_qualified = False
+                        disqualification_reason.append(f"Too far ({tech_distance:.1f} miles > {radius_miles} miles)")
+                        logger.debug(f"- {tech.name}: Skipped (Too far: {tech_distance:.1f} miles)")
+                except Exception as e:
+                    is_qualified = False
+                    disqualification_reason.append(f"Error calculating distance: {e}")
+                    logger.error(f"- {tech.name}: Error calculating distance: {e}", exc_info=True)
+
+        # 3. Check requirements (only if still qualified)
+        if is_qualified:
+            reqs = work_order.requirements or {}
+            
+            # Drug Screening
+            if reqs.get('drug_screen', False) and not tech.drug_screening:
+                is_qualified = False
+                disqualification_reason.append("Fails drug screening requirement")
+                logger.debug(f"- {tech.name}: Skipped (Fails drug screening: WO Requires={reqs.get('drug_screen')}, Tech Has={tech.drug_screening})")
+            
+            # Background Check
+            if is_qualified and reqs.get('background_check', False) and not tech.background_check:
+                is_qualified = False
+                disqualification_reason.append("Fails background check requirement")
+                logger.debug(f"- {tech.name}: Skipped (Fails background check: WO Requires={reqs.get('background_check')}, Tech Has={tech.background_check})")
+            
+            # Minimum Experience
+            min_exp = reqs.get('min_experience', 0)
+            if is_qualified and (tech.experience_years is None or tech.experience_years < min_exp):
+                is_qualified = False
+                disqualification_reason.append(f"Insufficient experience ({tech.experience_years or 0} yrs < {min_exp} yrs)")
+                logger.debug(f"- {tech.name}: Skipped (Insufficient experience: WO Min={min_exp}, Tech Has={tech.experience_years})")
+
+        # 4. Check skills (only if still qualified)
+        if is_qualified and work_order.required_skills:
             tech_skills = tech.skills or {}
             meets_skills = True
             for skill in work_order.required_skills:
                 skill_value = tech_skills.get(skill, '0/10')
                 try:
                     # Convert skill value to integer for comparison
-                    # Handle cases where skill_value might be just a number string (e.g., "7")
                     if isinstance(skill_value, str) and '/' in skill_value:
                         rating = int(skill_value.split('/')[0])
                     elif isinstance(skill_value, str) and skill_value.isdigit():
                         rating = int(skill_value)
                     elif isinstance(skill_value, int):
                         rating = skill_value
-                    else: # Fallback for unparseable or non-numeric values
-                        rating = 0 
+                    else: 
+                        rating = 0 # Default for unparseable values
                         
                     if rating < work_order.minimum_skill_level:
                         meets_skills = False
-                        break
+                        disqualification_reason.append(f"Insufficient skill level for '{skill}' ({rating}/10 < {work_order.minimum_skill_level}/10)")
+                        logger.debug(f"- {tech.name}: Fails skill '{skill}' (Tech: {rating}/10, WO Min: {work_order.minimum_skill_level}/10)")
+                        break # Break from inner skill loop
                 except (ValueError, TypeError):
                     meets_skills = False
-                    break
+                    disqualification_reason.append(f"Invalid skill rating for '{skill}'")
+                    logger.debug(f"- {tech.name}: Fails skill '{skill}' (Invalid rating format)")
+                    break # Break from inner skill loop
             
             if not meets_skills:
-                continue
-            
-        qualified_pool.append({
-            'technician': tech,
-            'distance': distance
-        })
-    
-    return qualified_pool
+                is_qualified = False # Set overall qualification to False if skills not met
+
+        # Add to qualified pool or potential_technicians_data
+        tech_data_for_dashboard = {
+            'id': tech.id,
+            'name': tech.name,
+            'mobile_phone': tech.mobile_phone,
+            'email': tech.email,
+            'address': tech.address,
+            'city': tech.city,
+            'state': tech.state,
+            'zip_code': tech.zip_code,
+            'latitude': tech.latitude,
+            'longitude': tech.longitude,
+            'is_qualified': is_qualified,
+            'distance': tech_distance,
+            'reasons': ", ".join(disqualification_reason) if disqualification_reason else "N/A"
+        }
+        potential_technicians_data.append(tech_data_for_dashboard)
+
+        if is_qualified:
+            qualified_pool.append({
+                'technician': tech,
+                'distance': tech_distance
+            })
+            logger.info(f"--- QUALIFIED: {tech.name} (ID: {tech.id}), Distance: {tech_distance:.2f} miles ---")
+        else:
+            logger.info(f"--- DISQUALIFIED: {tech.name} (ID: {tech.id}), Reason(s): {', '.join(disqualification_reason) if disqualification_reason else 'Unknown'} ---")
+
+    logger.info(f"--- Qualification check finished. Total qualified: {len(qualified_pool)} ---")
+    return qualified_pool, potential_technicians_data
+
 
 def make_ai_call(campaign, tech_data):
     tech = tech_data['technician']
+    
+    logger.info(f"Attempting to make AI call to technician: {tech.name} ({tech.mobile_phone}) for Campaign ID: {campaign.id}")
     
     # Create call log
     call_log = CallLog(
@@ -335,17 +406,21 @@ def make_ai_call(campaign, tech_data):
         # You would integrate your Twilio/OpenRouter logic here
         
         # Example of simulating Twilio call (requires TWILIO_ACCOUNT_SID etc. to be set)
-        # if twilio_client:
-        #     call = twilio_client.calls.create(
-        #         twiml='<Response><Say>Hello from FSN AI calling system.</Say></Response>',
-        #         to=tech.mobile_phone,
-        #         from_=TWILIO_PHONE_NUMBER
-        #     )
-        #     call_log.twilio_call_sid = call.sid
-        #     # You would then have a Twilio webhook for status updates,
-        #     # but for this simulation, we'll assign a result directly.
-        # else:
-        #     logger.warning("Twilio client not initialized. Simulating call result.")
+        if twilio_client and TWILIO_PHONE_NUMBER:
+            logger.info(f"Attempting Twilio call to {tech.mobile_phone} from {TWILIO_PHONE_NUMBER}...")
+            # For a real call, you'd need a TwiML URL. Here's a placeholder.
+            # Replace with your actual TwiML endpoint URL on Render
+            call = twilio_client.calls.create(
+                url=url_for('twilio_voice_webhook', _external=True), # Example webhook URL
+                to=tech.mobile_phone,
+                from_=TWILIO_PHONE_NUMBER
+            )
+            call_log.twilio_call_sid = call.sid
+            logger.info(f"Twilio call initiated for {tech.name}. SID: {call.sid}")
+            # You would then typically have a Twilio webhook update the call status/result
+            # For now, we'll assign a simulated result immediately.
+        else:
+            logger.warning("Twilio client not initialized or phone number missing. Simulating call result.")
 
         responses = ['interested', 'not_interested', 'callback', 'unavailable']
         weights = [0.25, 0.45, 0.20, 0.10]
@@ -360,7 +435,7 @@ def make_ai_call(campaign, tech_data):
             
         db.session.commit() # Commit the call result and campaign updates
         
-        logger.info(f"Call completed: {tech.name} ({tech.mobile_phone}) -> {result}")
+        logger.info(f"Simulated call for {tech.name} completed: Result -> {result}")
         
         return {
             'call_log_id': call_log.id,
@@ -378,7 +453,7 @@ def make_ai_call(campaign, tech_data):
         call_log.call_result = 'error'
         call_log.ai_conversation = f"Error during call simulation: {str(e)}"
         db.session.commit()
-        logger.error(f"Call failed for {tech.name} ({tech.mobile_phone}): {e}")
+        logger.error(f"Call failed for {tech.name} ({tech.mobile_phone}): {e}", exc_info=True)
         return {
             'call_log_id': call_log.id,
             'technician_id': tech.id,
@@ -401,7 +476,7 @@ def index():
         current_user.last_login = datetime.utcnow()
         db.session.commit()
     except Exception as e:
-        logger.error(f"Error updating last login for user {current_user.username}: {e}")
+        logger.error(f"Error updating last login for user {current_user.username}: {e}", exc_info=True)
         db.session.rollback() # Rollback if there's a problem committing
 
     if current_user.is_admin():
@@ -527,7 +602,8 @@ def create_work_order():
         except Exception as e:
             db.session.rollback()
             flash(f'Error creating work order: {str(e)}', 'error')
-    
+            logger.error(f"Error creating work order: {e}", exc_info=True)
+
     return render_template('work_order/create.html', form=form)
 
 @app.route('/start_campaign/<int:work_order_id>')
@@ -541,13 +617,14 @@ def start_campaign(work_order_id):
     
     existing_campaign = CallCampaign.query.filter_by(work_order_id=work_order.id, status='active').first()
     if existing_campaign:
+        flash(f'Campaign for Work Order {work_order.work_order_id} is already active!', 'info')
         return redirect(url_for('campaign_dashboard', campaign_id=existing_campaign.id))
     
     campaign = CallCampaign(work_order_id=work_order.id, target_responses=5)
     db.session.add(campaign)
     db.session.commit()
     
-    flash('Campaign started successfully!', 'success')
+    flash('Campaign started successfully! Review potential technicians and initiate calls.', 'success')
     return redirect(url_for('campaign_dashboard', campaign_id=campaign.id))
 
 @app.route('/campaign/<int:campaign_id>')
@@ -560,18 +637,32 @@ def campaign_dashboard(campaign_id):
         flash('Access denied!', 'error')
         return redirect(url_for('index'))
     
+    # Get all already called technicians for this campaign
+    called_tech_ids = [log.technician_id for log in 
+                       CallLog.query.filter_by(campaign_id=campaign.id).all()]
+    
+    # Find qualified technicians and get detailed data for dashboard
+    qualified_pool, all_technicians_for_dashboard = find_qualified_technicians(
+        work_order,
+        campaign.current_radius,
+        exclude_called_ids=called_tech_ids # Pass existing called IDs to the function
+    )
+
     # Fetch call logs along with associated technician details using a join
-    call_logs = db.session.query(CallLog, Technician).join(Technician).\
+    call_logs_with_tech = db.session.query(CallLog, Technician).\
+                join(Technician).\
                 filter(CallLog.campaign_id == campaign.id).\
                 order_by(CallLog.called_at.desc()).all()
     
     stats = {
-        'total_calls': len(call_logs),
-        'interested': len([log for log, _ in call_logs if log.call_result == 'interested']),
-        'not_interested': len([log for log, _ in call_logs if log.call_result == 'not_interested']),
-        'callbacks': len([log for log, _ in call_logs if log.call_result == 'callback']),
+        'total_calls': len(call_logs_with_tech),
+        'interested': len([log for log, _ in call_logs_with_tech if log.call_result == 'interested']),
+        'not_interested': len([log for log, _ in call_logs_with_tech if log.call_result == 'not_interested']),
+        'callbacks': len([log for log, _ in call_logs_with_tech if log.call_result == 'callback']),
         'current_radius': campaign.current_radius,
-        'success_rate': (len([log for log, _ in call_logs if log.call_result == 'interested']) / len(call_logs) * 100) if call_logs else 0
+        'success_rate': (len([log for log, _ in call_logs_with_tech if log.call_result == 'interested']) / len(call_logs_with_tech) * 100) if call_logs_with_tech else 0,
+        'potential_candidates_count': len(all_technicians_for_dashboard), # Total techs considered
+        'qualified_candidates_count': len(qualified_pool) # Total qualified from current radius/criteria
     }
     
     # Generate CSRF token for any AJAX calls on this page
@@ -580,8 +671,10 @@ def campaign_dashboard(campaign_id):
     return render_template('campaign/dashboard.html', 
                            campaign=campaign,
                            work_order=work_order,
-                           call_logs=call_logs, # This will now be a list of (CallLog, Technician) tuples
-                           stats=stats)
+                           call_logs=call_logs_with_tech, # This will be a list of (CallLog, Technician) tuples
+                           all_technicians_data=all_technicians_for_dashboard, # New data for potential techs
+                           stats=stats,
+                           ) # Pass the token
 
 @app.route('/upload_technicians', methods=['GET', 'POST'])
 @login_required
@@ -608,6 +701,7 @@ def upload_technicians():
                 return redirect(url_for('list_technicians')) # Redirect to new technician list page
             except Exception as e:
                 flash(f'Error processing file: {str(e)}', 'error')
+                logger.error(f"Error processing upload file: {e}", exc_info=True)
         else:
             flash('Please upload an Excel (.xlsx) file!', 'error')
     
@@ -662,46 +756,55 @@ def api_start_calling(campaign_id):
         return jsonify({'error': 'Access denied'}), 403
     
     try:
-        batch_size = request.json.get('batch_size', 10)
+        batch_size = request.json.get('batch_size', 5) # Default to 5 calls per batch
         
         # Get already called technician IDs for this campaign
         called_ids = [log.technician_id for log in 
                       CallLog.query.filter_by(campaign_id=campaign.id).all()]
         
-        # Find qualified pool
-        qualified_pool = find_qualified_technicians(
+        # Find qualified pool based on current radius and excluding already called
+        qualified_pool, _ = find_qualified_technicians(
             campaign.work_order,
             campaign.current_radius,
             exclude_called_ids=called_ids
         )
         
         if not qualified_pool:
+            logger.info(f"Campaign {campaign.id}: No new qualified technicians found for calling.")
             return jsonify({
                 'status': 'no_candidates',
                 'pool_size': 0,
-                'message': f'No qualified technicians found within {campaign.current_radius} miles not yet called.'
+                'message': f'No new qualified technicians found within {campaign.current_radius} miles not yet called.'
             })
         
         # RANDOM SELECTION FOR FAIRNESS
         random.shuffle(qualified_pool)
-        selected_techs = qualified_pool[:batch_size]
+        selected_techs_for_call = qualified_pool[:batch_size]
         
+        if not selected_techs_for_call:
+            logger.info(f"Campaign {campaign.id}: Qualified pool is empty after batch selection.")
+            return jsonify({
+                'status': 'no_candidates',
+                'pool_size': len(qualified_pool),
+                'message': 'No technicians selected for this batch (pool too small).'
+            })
+
         # Execute calls
         results = []
-        for tech_data in selected_techs:
+        for tech_data in selected_techs_for_call:
             result = make_ai_call(campaign, tech_data)
             results.append(result)
             
         return jsonify({
             'status': 'completed',
             'pool_size': len(qualified_pool),
-            'called': len(selected_techs),
+            'called': len(selected_techs_for_call),
             'results': results,
             'current_responses': campaign.current_responses # Update this to reflect new responses
         })
             
     except Exception as e:
-        logger.error(f"Calling failed: {e}")
+        logger.error(f"API Calling failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/expand_radius/<int:campaign_id>', methods=['POST'])
@@ -717,11 +820,11 @@ def api_expand_radius(campaign_id):
         campaign.current_radius += expansion
         db.session.commit()
         
-        # Execute calling round with new radius
+        # Re-evaluate candidates with new radius (no calls made here, just update count)
         called_ids = [log.technician_id for log in 
                       CallLog.query.filter_by(campaign_id=campaign.id).all()]
         
-        qualified_pool = find_qualified_technicians(
+        qualified_pool, _ = find_qualified_technicians(
             campaign.work_order,
             campaign.current_radius,
             exclude_called_ids=called_ids
@@ -736,64 +839,129 @@ def api_expand_radius(campaign_id):
             
     except Exception as e:
         db.session.rollback()
+        logger.error(f"API radius expansion failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+# Placeholder Twilio Voice Webhook (If you implement actual Twilio calls)
+@app.route('/twilio_voice_webhook', methods=['POST'])
+def twilio_voice_webhook():
+    """
+    This endpoint would receive updates from Twilio during a call.
+    For this simulation, it's just a placeholder.
+    In a real system, you'd parse Twilio's request and update CallLog status/results.
+    """
+    # Parse Twilio's request to get CallSid, CallStatus etc.
+    call_sid = request.form.get('CallSid')
+    call_status = request.form.get('CallStatus') # e.g., 'completed', 'no-answer', 'failed'
+    duration = request.form.get('CallDuration')
+    
+    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}, Duration: {duration}")
+
+    # You would typically find the CallLog entry by twilio_call_sid and update it
+    # For now, this is a basic logging and response.
+    
+    response = TwiMLResponse()
+    response.say("Thank you for contacting Field Services Nationwide. Your call has been logged.")
+    # You would typically implement more sophisticated IVR or connect to your AI here
+    return str(response)
 
 # ==================== HELPER FUNCTIONS ====================
 
 def import_technicians_from_df(df):
     imported_count = 0
     
-    for _, row in df.iterrows():
+    # Ensure all expected columns are present, even if empty, to avoid KeyError
+    expected_columns = [
+        'Name of Technician', 'Email', 'Mobile/Cell Phone', 'Home Phone',
+        'Address - Street', 'Address - City', 'Address - State/Province', 'Address - Zip Code',
+        'Number of Years of Experience in the IT Industry', 'Able to Pass a Drug Screening?',
+        'Able to Pass a Background Check?', 'Tools', 
+        # Skill columns - make sure these match your spreadsheet exactly
+        'POS (Point of Sale Machines)', 'Laptop Repair', 'Network Troubleshooting',
+        'Security Cameras', 'Cat5/6', 'Server Programming'
+    ]
+    # Add any missing columns to DataFrame with NaN values to prevent KeyError
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = None # Add the column with None values
+
+    for index, row in df.iterrows():
         try:
-            # Skip rows where 'Name of Technician' is missing or empty
+            # Strip whitespace and convert to string, handling NaN
             tech_name = str(row.get('Name of Technician', '')).strip()
             if not tech_name:
-                logger.warning(f"Skipping row due to missing technician name: {row.to_dict()}")
+                logger.warning(f"Skipping row {index+1} due to missing or empty technician name: {row.to_dict()}")
                 continue
 
-            zip_code = str(row.get('Address - Zip Code', '')).strip()
-            lat, lon = get_coordinates(zip_code) if zip_code else (None, None)
+            mobile_phone = str(row.get('Mobile/Cell Phone', '')).strip()
+            if not mobile_phone:
+                logger.warning(f"Skipping row {index+1} ({tech_name}) due to missing mobile phone.")
+                continue
+
+            email = str(row.get('Email', '')).strip() or None # Allow email to be None if empty
+
+            logger.debug(f"Processing technician: {tech_name}, Mobile: {mobile_phone}, Email: {email} (Row {index+1})")
+
+            # Check for existing technician by mobile_phone or email to prevent duplicates
+            # Only check if mobile_phone or email are not None
+            existing_tech_query = Technician.query.filter(
+                (Technician.mobile_phone == mobile_phone)
+            )
+            if email:
+                existing_tech_query = existing_tech_query.union(
+                    Technician.query.filter(Technician.email == email)
+                )
             
-            # Safely get experience years, handling non-numeric or empty strings
+            existing_tech = existing_tech_query.first()
+
+            if existing_tech:
+                logger.info(f"Technician '{tech_name}' (Mobile: {mobile_phone}, Email: {email}) already exists (ID: {existing_tech.id}). Skipping import.")
+                continue # Skip this row as it's a duplicate based on mobile_phone or email
+            
+            # Geocoding
+            zip_code = str(row.get('Address - Zip Code', '')).strip()
+            lat, lon = None, None
+            if zip_code:
+                lat, lon = get_coordinates(zip_code)
+            else:
+                logger.warning(f"Zip code missing for {tech_name} (Row {index+1}). Skipping geocoding.")
+            
+            # Safely parse experience years
             exp_str = str(row.get('Number of Years of Experience in the IT Industry', '')).strip()
-            exp_years = 0
+            exp_years = 0 # Default value
             if exp_str:
                 try:
-                    # Attempt to convert to float first, then int, to handle "7.0"
-                    exp_years = int(float(exp_str))
-                except ValueError:
-                    logger.warning(f"Could not parse experience years '{exp_str}' for {tech_name}. Defaulting to 0.")
-                    exp_years = 0 # Default to 0 if parsing fails
-            
+                    exp_years = int(float(exp_str)) # Handles "7.0"
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse experience years '{exp_str}' for {tech_name} (Row {index+1}). Defaulting to 0.")
+
+            # Safely parse boolean fields ('yes'/'no' or empty)
+            drug_screening = str(row.get('Able to Pass a Drug Screening?', '')).strip().lower() == 'yes'
+            background_check = str(row.get('Able to Pass a Background Check?', '')).strip().lower() == 'yes'
+
+            # Parse skills (assuming you want to convert "7/10" to "7")
             skills = {}
             skill_columns = [
                 'POS (Point of Sale Machines)', 'Laptop Repair', 'Network Troubleshooting',
                 'Security Cameras', 'Cat5/6', 'Server Programming'
             ]
-            
-            for skill in skill_columns:
-                if skill in row and pd.notna(row[skill]):
-                    skills[skill] = str(row[skill]).strip()
-            
-            # Prepare boolean fields, handling potential missing values
-            drug_screening_val = str(row.get('Able to Pass a Drug Screening?', '')).strip().lower()
-            drug_screening = True if drug_screening_val == 'yes' else (False if drug_screening_val == 'no' else False) # Default to False if not 'yes' or 'no'
+            for skill_col in skill_columns:
+                if skill_col in row and pd.notna(row[skill_col]):
+                    skill_val = str(row[skill_col]).strip()
+                    # Example: if you want '7/10' to become '7', you'd parse it here
+                    skills[skill_col.replace(' (Point of Sale Machines)', '')] = skill_val # Clean up key name
 
-            background_check_val = str(row.get('Able to Pass a Background Check?', '')).strip().lower()
-            background_check = True if background_check_val == 'yes' else (False if background_check_val == 'no' else False) # Default to False if not 'yes' or 'no'
-
-            # Get Home Phone and Address
-            home_phone_val = str(row.get('Home Phone', '')).strip()
-            address_val = str(row.get('Address - Street', '')).strip() # Assuming 'Address - Street' for full address
-            tools_val = str(row.get('Tools', '')).strip() # Assuming 'Tools' column for tools
-
+            # Get Home Phone, Address, and Tools
+            home_phone_val = str(row.get('Home Phone', '')).strip() or None
+            address_val = str(row.get('Address - Street', '')).strip() or None # Assuming 'Address - Street' for full address
+            tools_val = str(row.get('Tools', '')).strip() or None # Assuming 'Tools' column for tools
 
             technician = Technician(
                 name=tech_name,
-                email=str(row.get('Email', '')).strip() or None,
-                mobile_phone=str(row.get('Mobile/Cell Phone', '')).strip(),
-                home_phone=home_phone_val or None, # Use the extracted value
-                address=address_val or None,       # Use the extracted value
+                email=email,
+                mobile_phone=mobile_phone,
+                home_phone=home_phone_val,
+                address=address_val,
                 city=str(row.get('Address - City', '')).strip() or None,
                 state=str(row.get('Address - State/Province', '')).strip() or None,
                 zip_code=zip_code or None,
@@ -802,50 +970,44 @@ def import_technicians_from_df(df):
                 experience_years=exp_years,
                 drug_screening=drug_screening,
                 background_check=background_check,
-                skills=skills,
-                tools=tools_val or None, # Use the extracted value
-                is_active=True # Assume active upon import
+                skills=skills if skills else None, # Store as None if empty dict
+                tools=tools_val,
+                is_active=True
             )
-            
-            # Check for existing technician by mobile_phone or email to prevent duplicates
-            existing_tech = Technician.query.filter(
-                (Technician.mobile_phone == technician.mobile_phone) |
-                (Technician.email == technician.email)
-            ).first()
-
-            if existing_tech:
-                logger.info(f"Technician with mobile phone {technician.mobile_phone} or email {technician.email} already exists. Skipping or updating.")
-                # You could add logic here to update existing_tech instead of skipping
-                # For now, we'll just skip to avoid adding duplicates.
-                continue
             
             db.session.add(technician)
             imported_count += 1
+            logger.info(f"Successfully added technician: {technician.name} (Row {index+1})")
             
             # Commit in batches to reduce transaction size but ensure persistence
-            if imported_count % 50 == 0: # Commit every 50 records
+            # Commit after every record for immediate feedback in logs during debugging
+            if imported_count % 1 == 0: 
                 db.session.commit()
                 logger.info(f"Committed {imported_count} technicians so far.")
                 
         except Exception as e:
-            logger.error(f"Error importing technician row ({row.get('Name of Technician', 'N/A')}): {e}")
+            logger.error(f"Failed to import technician from row {index+1} (Name: {row.get('Name of Technician', 'N/A')}): {e}", exc_info=True)
             db.session.rollback() # Rollback current transaction if error occurs
 
     db.session.commit() # Final commit for any remaining records
+    logger.info(f"Finished technician import. Total imported: {imported_count}")
     return imported_count
 
 def create_admin_user():
-    if not User.query.filter_by(username='admin').first():
-        admin = User(
-            username='admin',
-            email='admin@fieldservicesnationwide.com',
-            role='admin',
-            company_name='Field Services Nationwide'
-        )
-        admin.set_password('admin123')
-        db.session.add(admin)
-        db.session.commit()
-        logger.info("Created admin user: username='admin', password='admin123'")
+    with app.app_context(): # Ensure admin user creation is within app context
+        if not User.query.filter_by(username='admin').first():
+            admin = User(
+                username='admin',
+                email='admin@fieldservicesnationwide.com',
+                role='admin',
+                company_name='Field Services Nationwide'
+            )
+            admin.set_password('admin123')
+            db.session.add(admin)
+            db.session.commit()
+            logger.info("Created admin user: username='admin', password='admin123'")
+        else:
+            logger.info("Admin user already exists.")
 
 # Health check
 @app.route('/health')
@@ -855,13 +1017,39 @@ def health_check():
         'timestamp': datetime.utcnow().isoformat()
     })
 
+# Twilio Voice Webhook placeholder (if actual Twilio calls are used)
+# This will listen for Twilio's POST requests to your app's /twilio_voice_webhook URL
+@app.route('/twilio_voice_webhook', methods=['POST'])
+def twilio_voice_webhook():
+    """
+    This endpoint would receive updates from Twilio during a call.
+    For this simulation, it's just a placeholder.
+    In a real system, you'd parse Twilio's request and update CallLog status/results.
+    """
+    # Parse Twilio's request to get CallSid, CallStatus etc.
+    call_sid = request.form.get('CallSid')
+    call_status = request.form.get('CallStatus') # e.g., 'completed', 'no-answer', 'failed'
+    duration = request.form.get('CallDuration')
+    
+    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}, Duration: {duration}")
+
+    # You would typically find the CallLog entry by twilio_call_sid and update it
+    # For now, this is a basic logging and response.
+    
+    response = TwiMLResponse()
+    response.say("Thank you for contacting Field Services Nationwide. Your call has been logged.")
+    # You would typically implement more sophisticated IVR or connect to your AI here
+    return str(response)
+
+# ==================== MAIN EXECUTION ====================
+
 if __name__ == '__main__':
     with app.app_context():
-        # Using Flask-Migrate is preferred for schema management in production.
-        # Ensure 'flask db upgrade' is run in your Render build command.
-        # db.create_all() # Commented out, rely on migrations or explicit script
-        create_admin_user()
+        # Ensure database tables are created or migrated
+        # If you are using 'flask db upgrade' in Render build command, this is not strictly needed here
+        # db.create_all() 
+        create_admin_user() # Ensure admin user exists on app startup
     
     port = int(os.environ.get('PORT', 5000))
+    # In production, debug=False is crucial. Render handles the serving.
     app.run(host='0.0.0.0', port=port, debug=False)
-
