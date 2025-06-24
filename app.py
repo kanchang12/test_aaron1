@@ -14,19 +14,22 @@ from dotenv import load_dotenv
 import pandas as pd
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
-# from twilio.rest import Client # Commented out as per previous instructions if not used
-# from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse # Commented out
+from twilio.rest import Client # <-- Make sure this line is present and NOT commented out
+from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse # <-- Also ensure this is present if you use TwiMLResponse
 import requests
+import sqlalchemy # <-- This was added recently for the SQL executor
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm, CSRFProtect
 from flask_migrate import Migrate
-from flask_wtf.csrf import generate_csrf # Import generate_csrf for manual token generation
+from flask_wtf.csrf import generate_csrf
 from wtforms import StringField, PasswordField, SelectField, TextAreaField, IntegerField, FloatField, BooleanField
 from wtforms.validators import DataRequired, Email, Length, EqualTo, NumberRange
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# ... rest of your app.py code ...
 
 # Load environment variables
 load_dotenv()
