@@ -539,60 +539,49 @@ def index():
                            active_campaigns=active_campaigns,
                            stats=stats)
 
-@app.route('/twilio_voice_webhook', methods=['POST', 'GET'])
+@app.route('/twilio_voice_webhook', methods=['GET', 'POST'])
 def twilio_voice_webhook():
-    call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus')
-    
-    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}")
-
-    # ONLY respond to 'answered' status - ignore all others
-    if call_status != 'answered':
-        logger.info(f"Ignoring status: {call_status}")
-        return '', 200  # Return empty response with 200 status
-    
-    # Handle answered call
-    response = TwiMLResponse()
     call_log_id = request.args.get('call_log_id')
-    call_log = CallLog.query.get(call_log_id) if call_log_id else None
     
-    if call_log:
-        call_log.call_status = 'answered'
-        
-        # Get context for AI
-        technician = Technician.query.get(call_log.technician_id)
-        campaign = CallCampaign.query.get(call_log.campaign_id)
-        work_order = campaign.work_order if campaign else None
-        
-        # Build AI prompt
-        initial_prompt = (
-            "You are Sarah, an AI assistant from Field Services Nationwide. "
-            "Introduce yourself briefly and explain you're calling about a job opportunity. "
-            "Ask if they're available to chat. Keep it under 15 seconds. "
+    if request.method == 'GET':
+        # This is the actual call flow - provide TwiML
+        logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
+        response = TwiMLResponse()
+        response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?")
+        response.gather(
+            input='speech',
+            speechTimeout='auto',
+            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+            method='POST',
+            actionOnEmptyResult=True
         )
-        
-        if technician and work_order:
-            initial_prompt += f"The technician's name is {technician.name}. "
-        
-        ai_response = call_gemini_api(initial_prompt)
-        if not ai_response:
-            ai_response = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat briefly?"
-        
-        call_log.ai_conversation = f"AI: {ai_response}"
-        db.session.commit()
-        
-        response.say(ai_response)
-    else:
-        response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
+        return str(response)
     
-    # Start conversation
-    response.gather(
-        input='speech', 
-        speechTimeout='auto', 
-        action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-        method='POST',
-        actionOnEmptyResult=True
-    )
+    else:  # POST method - status updates only
+        call_sid = request.form.get('CallSid')
+        call_status = request.form.get('CallStatus')
+        logger.info(f"Status update: CallSid={call_sid}, Status={call_status}")
+        
+        # Just log status updates, don't provide TwiML
+        if call_log_id and call_status in ['answered', 'completed']:
+            call_log = CallLog.query.get(call_log_id)
+            if call_log:
+                call_log.call_status = call_status
+                db.session.commit()
+        
+        return '', 200  # Empty response for status updates
+
+@app.route('/twilio_handle_response', methods=['POST'])
+def twilio_handle_response():
+    call_sid = request.form.get('CallSid')
+    speech_result = request.form.get('SpeechResult', '')
+    call_log_id = request.args.get('call_log_id')
+    
+    logger.info(f"Speech from {call_sid}: '{speech_result}'")
+    
+    response = TwiMLResponse()
+    response.say(f"I heard you say: {speech_result}. Thanks for talking!")
+    response.hangup()
     
     return str(response)
 
