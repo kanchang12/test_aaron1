@@ -14,25 +14,24 @@ from dotenv import load_dotenv
 import pandas as pd
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
-# Ensure Twilio Client is imported and not commented out
 from twilio.rest import Client 
-from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse 
-import requests
-import sqlalchemy # Added for explicit SQL query executor support
+from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse, Say, Gather, Hangup 
+import requests # Used for calling external APIs like Gemini
+
+import sqlalchemy 
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_wtf import FlaskForm # Keep FlaskForm if your forms inherit from it
-from flask_wtf.csrf import CSRFProtect, generate_csrf # Keep CSRFProtect if you want it enabled
+from flask_wtf import FlaskForm # Kept for general forms, but CSRF functionality removed
 from flask_migrate import Migrate
 from wtforms import StringField, PasswordField, SelectField, TextAreaField, IntegerField, FloatField, BooleanField
 from wtforms.validators import DataRequired, Email, Length, EqualTo, NumberRange
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Configure logging: Set to DEBUG for very detailed logs for troubleshooting, INFO for general
-# For debugging "no eligible technicians", set this to logging.DEBUG
-logging.basicConfig(level=logging.INFO) # <<< CHANGE THIS TO logging.DEBUG FOR DETAILED QUALIFICATION LOGS
+# For debugging AI conversation, set this to logging.DEBUG
+logging.basicConfig(level=logging.INFO) # Set this to logging.DEBUG for verbose AI prompts/responses
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -43,22 +42,31 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///fsn_calling.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['WTF_CSRF_ENABLED'] = False # Keep this True if you want Flask-WTF forms to use CSRF
-# Manually remove CSRFProtect if you want no CSRF protection at all
-#csrf = CSRFProtect(app) 
+# Explicitly confirm no CSRF: app.config['WTF_CSRF_ENABLED'] is not set or is False
+# All imports and uses of CSRFProtect and generate_csrf are removed.
+
+# Initialize extensions
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access this page.'
+login_manager.login_message_category = 'info'
+
 
 # Configuration
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '') # Automatically provided by Canvas runtime
 
 # Initialize clients (handle cases where Twilio SID might be missing)
-# Ensure Twilio Client is correctly initialized AFTER its import
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 geolocator = Nominatim(user_agent="fsn_calling_system")
 
 # ==================== DATABASE MODELS ====================
+# (Your existing database models - User, Technician, WorkOrder, CallCampaign, CallLog - are here)
 
 class User(UserMixin, db.Model):
     __tablename__ = 'users'
@@ -159,7 +167,6 @@ class CallLog(db.Model):
     call_status = db.Column(db.String(20), nullable=False, index=True) # e.g., 'calling', 'answered', 'failed'
     call_result = db.Column(db.String(20), index=True) # e.g., 'interested', 'not_interested', 'callback', 'unavailable'
     call_duration = db.Column(db.Integer)
-    distance_miles = db.Column(db.Float)
     ai_conversation = db.Column(db.Text)
     twilio_call_sid = db.Column(db.String(100))
     called_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -217,16 +224,65 @@ class WorkOrderForm(FlaskForm):
     background_check = BooleanField('Background Check Required')
     min_experience = IntegerField('Minimum Experience (years)', validators=[NumberRange(min=0, max=30)], default=0)
 
+# ==================== LLM INTEGRATION ====================
+
+def call_gemini_api(prompt, model="gemini-2.0-flash"):
+    """
+    Calls the Gemini API to generate text based on a prompt.
+    """
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY is not set. Cannot call Gemini API. Using fallback message.")
+        return "I am sorry, I cannot generate a response right now due to an internal configuration issue."
+
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 200 # Limit response length for voice calls to avoid long pauses
+        }
+    }
+
+    try:
+        logger.info(f"Calling Gemini API with prompt: '{prompt[:100]}...'")
+        response = requests.post(api_url, headers=headers, json=payload, timeout=20) # Increased timeout
+        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+        
+        json_response = response.json()
+        
+        if json_response and json_response.get('candidates'):
+            generated_text = json_response['candidates'][0]['content']['parts'][0]['text']
+            logger.info(f"Gemini API response (first 100 chars): '{generated_text[:100]}...'")
+            return generated_text
+        else:
+            logger.warning(f"Gemini API returned no candidates or unexpected format: {json_response}")
+            return "I am sorry, I couldn't generate a coherent response from the AI."
+    except requests.exceptions.Timeout:
+        logger.error("Gemini API call timed out.")
+        return "I am sorry, the AI is taking too long to respond. Please try again."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling Gemini API: {e}", exc_info=True)
+        return f"I am sorry, there was a problem with the AI service: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error processing Gemini API response: {e}", exc_info=True)
+        return "I am sorry, an unexpected internal error occurred with the AI."
+
 # ==================== CALLING SYSTEM ====================
 
 def get_coordinates(zip_code):
     try:
-        # Handle NaN or non-string inputs from pandas
         if pd.isna(zip_code) or not isinstance(zip_code, str):
             logger.warning(f"Invalid zip code input for geocoding: '{zip_code}'. Returning None, None.")
             return None, None
         
-        # Increased timeout for robustness
         location = geolocator.geocode(zip_code, timeout=10)
         if location:
             logger.info(f"Geocoded zip '{zip_code}': Lat {location.latitude}, Lon {location.longitude}")
@@ -246,21 +302,18 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
     
     potential_technicians_data = [] # To store details for the dashboard
     
-    # Fetch all active technicians
     all_techs = Technician.query.filter(Technician.is_active == True).all()
     
     if not all_techs:
         logger.warning("No active technicians found in the database.")
-        return [], [] # Return empty qualified list and empty potential_technicians_data
+        return [], []
 
     qualified_pool = []
     
     work_order_location = (work_order.job_latitude, work_order.job_longitude)
     
-    # Check if work order has valid coordinates
     if not work_order.job_latitude or not work_order.job_longitude:
         logger.error(f"Work Order {work_order.work_order_id} has no valid coordinates. Cannot perform distance filtering.")
-        # All technicians will be disqualified by distance if work order location is bad
     
     for tech in all_techs:
         is_qualified = True
@@ -269,13 +322,11 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
 
         logger.debug(f"Checking Technician: {tech.name} (ID: {tech.id}, Phone: {tech.mobile_phone})")
         
-        # 1. Check if already called in this campaign
         if tech.id in exclude_called_ids:
             is_qualified = False
             disqualification_reason.append("Already called for this campaign")
             logger.debug(f"- {tech.name}: Skipped (Already called for this campaign)")
         
-        # 2. Check location and distance (only if not already disqualified)
         if is_qualified:
             tech_location = (tech.latitude, tech.longitude)
             if not tech.latitude or not tech.longitude:
@@ -283,7 +334,6 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
                 disqualification_reason.append("No valid coordinates")
                 logger.debug(f"- {tech.name}: Skipped (No valid technician coordinates: Lat={tech.latitude}, Lon={tech.longitude})")
             elif not work_order.job_latitude or not work_order.job_longitude:
-                 # This case is handled above, but as a secondary check for each tech
                 is_qualified = False
                 disqualification_reason.append("Work Order has no valid coordinates for distance check")
                 logger.debug(f"- {tech.name}: Skipped (Work Order has no valid coordinates for distance check)")
@@ -300,37 +350,31 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
                     disqualification_reason.append(f"Error calculating distance: {e}")
                     logger.error(f"- {tech.name}: Error calculating distance: {e}", exc_info=True)
 
-        # 3. Check requirements (only if still qualified)
         if is_qualified:
             reqs = work_order.requirements or {}
             
-            # Drug Screening
             if reqs.get('drug_screen', False) and not tech.drug_screening:
                 is_qualified = False
                 disqualification_reason.append("Fails drug screening requirement")
                 logger.debug(f"- {tech.name}: Skipped (Fails drug screening: WO Requires={reqs.get('drug_screen')}, Tech Has={tech.drug_screening})")
             
-            # Background Check
             if is_qualified and reqs.get('background_check', False) and not tech.background_check:
                 is_qualified = False
                 disqualification_reason.append("Fails background check requirement")
                 logger.debug(f"- {tech.name}: Skipped (Fails background check: WO Requires={reqs.get('background_check')}, Tech Has={tech.background_check})")
             
-            # Minimum Experience
             min_exp = reqs.get('min_experience', 0)
             if is_qualified and (tech.experience_years is None or tech.experience_years < min_exp):
                 is_qualified = False
                 disqualification_reason.append(f"Insufficient experience ({tech.experience_years or 0} yrs < {min_exp} yrs)")
                 logger.debug(f"- {tech.name}: Skipped (Insufficient experience: WO Min={min_exp}, Tech Has={tech.experience_years})")
 
-        # 4. Check skills (only if still qualified)
         if is_qualified and work_order.required_skills:
             tech_skills = tech.skills or {}
             meets_skills = True
             for skill in work_order.required_skills:
                 skill_value = tech_skills.get(skill, '0/10')
                 try:
-                    # Convert skill value to integer for comparison
                     if isinstance(skill_value, str) and '/' in skill_value:
                         rating = int(skill_value.split('/')[0])
                     elif isinstance(skill_value, str) and skill_value.isdigit():
@@ -338,23 +382,22 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
                     elif isinstance(skill_value, int):
                         rating = skill_value
                     else: 
-                        rating = 0 # Default for unparseable values
+                        rating = 0
                         
                     if rating < work_order.minimum_skill_level:
                         meets_skills = False
                         disqualification_reason.append(f"Insufficient skill level for '{skill}' ({rating}/10 < {work_order.minimum_skill_level}/10)")
                         logger.debug(f"- {tech.name}: Fails skill '{skill}' (Tech: {rating}/10, WO Min: {work_order.minimum_skill_level}/10)")
-                        break # Break from inner skill loop
+                        break 
                 except (ValueError, TypeError):
                     meets_skills = False
                     disqualification_reason.append(f"Invalid skill rating for '{skill}'")
                     logger.debug(f"- {tech.name}: Fails skill '{skill}' (Invalid rating format)")
-                    break # Break from inner skill loop
+                    break 
             
             if not meets_skills:
-                is_qualified = False # Set overall qualification to False if skills not met
+                is_qualified = False
 
-        # Add to qualified pool or potential_technicians_data
         tech_data_for_dashboard = {
             'id': tech.id,
             'name': tech.name,
@@ -396,73 +439,66 @@ def make_ai_call(campaign, tech_data):
         technician_id=tech.id,
         phone_number=tech.mobile_phone,
         distance_miles=tech_data['distance'],
-        call_status='calling' # Initial status
+        call_status='initiated' # Initial status: call is being initiated
     )
     db.session.add(call_log)
-    db.session.commit() # Commit to get call_log.id before potential errors
-    
-    try:
-        # Simulate AI conversation (replace with actual Twilio/OpenRouter)
-        # You would integrate your Twilio/OpenRouter logic here
-        
-        # Example of simulating Twilio call (requires TWILIO_ACCOUNT_SID etc. to be set)
-        if twilio_client and TWILIO_PHONE_NUMBER:
-            logger.info(f"Attempting Twilio call to {tech.mobile_phone} from {TWILIO_PHONE_NUMBER}...")
-            # For a real call, you'd need a TwiML URL. Here's a placeholder.
-            # Replace with your actual TwiML endpoint URL on Render
+    db.session.commit() # Commit to get call_log.id before potential errors or Twilio call
+
+    # --- REAL TWILIO CALL INTEGRATION ---
+    if twilio_client and TWILIO_PHONE_NUMBER:
+        try:
+            logger.info(f"Initiating REAL Twilio call to {tech.mobile_phone} from {TWILIO_PHONE_NUMBER}...")
+            # Pass call_log_id for context in subsequent webhooks
             call = twilio_client.calls.create(
-                url=url_for('twilio_voice_webhook', _external=True), # Example webhook URL
+                url=url_for('twilio_voice_webhook', _external=True, 
+                            call_log_id=call_log.id), 
                 to=tech.mobile_phone,
                 from_=TWILIO_PHONE_NUMBER
             )
             call_log.twilio_call_sid = call.sid
-            logger.info(f"Twilio call initiated for {tech.name}. SID: {call.sid}")
-            # You would then typically have a Twilio webhook update the call status/result
-            # For now, we'll assign a simulated result immediately.
-        else:
-            logger.warning("Twilio client not initialized or phone number missing. Simulating call result.")
+            call_log.call_status = 'ringing' # Call is now ringing
+            db.session.commit() # Save SID and updated status
+            logger.info(f"Twilio call initiated for {tech.name}. SID: {call.sid}. Status: {call.status}")
 
+        except Exception as e:
+            db.session.rollback() # Rollback if an error occurs during Twilio call initiation
+            call_log.call_status = 'failed_twilio_api'
+            call_log.call_result = 'error'
+            call_log.ai_conversation = f"Error initiating Twilio call: {str(e)}"
+            db.session.commit()
+            logger.error(f"Twilio API call failed for {tech.name} ({tech.mobile_phone}): {e}", exc_info=True)
+            return {
+                'call_log_id': call_log.id,
+                'technician_id': tech.id,
+                'name': tech.name,
+                'phone': tech.mobile_phone,
+                'call_status': 'failed_twilio_api',
+                'call_result': 'error',
+                'error': str(e)
+            }
+    else:
+        logger.warning("Twilio client not initialized or phone number missing. Simulating call results for logging.")
+        call_log.call_status = 'simulated'
         responses = ['interested', 'not_interested', 'callback', 'unavailable']
         weights = [0.25, 0.45, 0.20, 0.10]
-        result = random.choices(responses, weights=weights)[0]
-        
-        call_log.call_status = 'answered' if result in ['interested', 'not_interested', 'callback'] else 'failed'
-        call_log.call_result = result
-        call_log.call_duration = random.randint(90, 240) # Simulate duration
-        
-        if result == 'interested':
+        call_log.call_result = random.choices(responses, weights=weights)[0]
+        call_log.call_duration = random.randint(90, 240)
+        if call_log.call_result == 'interested':
             campaign.current_responses += 1
-            
-        db.session.commit() # Commit the call result and campaign updates
-        
-        logger.info(f"Simulated call for {tech.name} completed: Result -> {result}")
-        
-        return {
-            'call_log_id': call_log.id,
-            'technician_id': tech.id,
-            'name': tech.name,
-            'phone': tech.mobile_phone,
-            'call_status': call_log.call_status,
-            'call_result': result,
-            'distance': tech_data['distance']
-        }
-            
-    except Exception as e:
-        db.session.rollback() # Rollback if an error occurs during call processing
-        call_log.call_status = 'failed'
-        call_log.call_result = 'error'
-        call_log.ai_conversation = f"Error during call simulation: {str(e)}"
         db.session.commit()
-        logger.error(f"Call failed for {tech.name} ({tech.mobile_phone}): {e}", exc_info=True)
-        return {
-            'call_log_id': call_log.id,
-            'technician_id': tech.id,
-            'name': tech.name,
-            'phone': tech.mobile_phone,
-            'call_status': 'failed',
-            'call_result': 'error',
-            'error': str(e)
-        }
+    
+    logger.info(f"Call initiation logged for {tech.name}. Current Call Status: {call_log.call_status}")
+    
+    return {
+        'call_log_id': call_log.id,
+        'technician_id': tech.id,
+        'name': tech.name,
+        'phone': tech.mobile_phone,
+        'call_status': call_log.call_status,
+        'call_result': call_log.call_result if call_log.call_result else 'pending_response', # Reflects pending AI interaction
+        'distance': tech_data['distance'],
+        'twilio_call_sid': call_log.twilio_call_sid
+    }
 
 # ==================== ROUTES ====================
 
@@ -471,13 +507,12 @@ def index():
     if not current_user.is_authenticated:
         return redirect(url_for('login'))
     
-    # Update last login here, AFTER current_user is established
     try:
         current_user.last_login = datetime.utcnow()
         db.session.commit()
     except Exception as e:
         logger.error(f"Error updating last login for user {current_user.username}: {e}", exc_info=True)
-        db.session.rollback() # Rollback if there's a problem committing
+        db.session.rollback()
 
     if current_user.is_admin():
         recent_orders = WorkOrder.query.order_by(WorkOrder.created_at.desc()).limit(5).all()
@@ -665,16 +700,13 @@ def campaign_dashboard(campaign_id):
         'qualified_candidates_count': len(qualified_pool) # Total qualified from current radius/criteria
     }
     
-    # Generate CSRF token for any AJAX calls on this page
-    #csrf_token_value = generate_csrf()
-
     return render_template('campaign/dashboard.html', 
                            campaign=campaign,
                            work_order=work_order,
                            call_logs=call_logs_with_tech, # This will be a list of (CallLog, Technician) tuples
                            all_technicians_data=all_technicians_for_dashboard, # New data for potential techs
-                           stats=stats,
-                           ) # Pass the token
+                           stats=stats
+                           )
 
 @app.route('/upload_technicians', methods=['GET', 'POST'])
 @login_required
@@ -842,28 +874,216 @@ def api_expand_radius(campaign_id):
         logger.error(f"API radius expansion failed for campaign {campaign_id}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-# Placeholder Twilio Voice Webhook (If you implement actual Twilio calls)
+# Twilio Voice Webhook: This will receive actual call events from Twilio
 @app.route('/twilio_voice_webhook', methods=['POST'])
 def twilio_voice_webhook():
     """
-    This endpoint would receive updates from Twilio during a call.
-    For this simulation, it's just a placeholder.
-    In a real system, you'd parse Twilio's request and update CallLog status/results.
+    This endpoint is now configured to receive real updates from Twilio during a call.
+    It will respond with TwiML (Twilio Markup Language) to instruct Twilio on
+    what to say or do during the call.
     """
-    # Parse Twilio's request to get CallSid, CallStatus etc.
     call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus') # e.g., 'completed', 'no-answer', 'failed'
-    duration = request.form.get('CallDuration')
+    call_status = request.form.get('CallStatus') # e.g., 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'failed'
+    # 'From' is your Twilio number, 'To' is the technician's number
+    from_number = request.form.get('From') 
+    to_number = request.form.get('To') 
     
-    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}, Duration: {duration}")
+    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}")
 
-    # You would typically find the CallLog entry by twilio_call_sid and update it
-    # For now, this is a basic logging and response.
+    response = TwiMLResponse()
+    
+    # Retrieve call_log and related data using the call_log_id passed from make_ai_call
+    call_log_id = request.args.get('call_log_id')
+    call_log = CallLog.query.get(call_log_id) if call_log_id else None
+    technician = None
+    work_order = None
+    campaign = None
+
+    if call_log:
+        technician = Technician.query.get(call_log.technician_id)
+        campaign = CallCampaign.query.get(call_log.campaign_id)
+        if campaign:
+            work_order = WorkOrder.query.get(campaign.work_order_id)
+        
+        # Update call_log status based on Twilio webhook
+        call_log.call_status = call_status
+        
+        # If call completed and we haven't set a specific result from AI interaction, infer from Twilio status
+        if call_status == 'completed' and (call_log.call_result == 'pending_response' or call_log.call_result is None):
+            call_duration = request.form.get('CallDuration')
+            if call_status == 'completed' and call_duration and int(call_duration) > 0:
+                call_log.call_result = 'answered' # Was answered, but no specific AI outcome yet
+            elif call_status == 'no-answer':
+                call_log.call_result = 'no_answer'
+            elif call_status == 'busy':
+                call_log.call_result = 'busy'
+            elif call_status == 'failed':
+                call_log.call_result = 'failed'
+
+            call_log.call_duration = call_duration if call_duration else 0 # Store duration
+            
+        db.session.commit() # Save the latest status update
+
+    # --- LLM AI CONVERSATION LOGIC - Initial Turn ---
+    if call_status == 'answered':
+        # Construct a comprehensive prompt for Gemini for its initial greeting
+        initial_prompt = (
+            "You are an AI job assistant named 'Sarah' from Field Services Nationwide. "
+            "Your main goal is to determine if a technician is interested in a new job opportunity "
+            "and available for a human recruiter to follow up. "
+            "Start by introducing yourself as Sarah from Field Services Nationwide. "
+            "Then, state that you are calling about a job opportunity and ask if the technician is available "
+            "for a brief discussion. Keep your initial response concise and professional. "
+        )
+        
+        # Add work order and technician context if available
+        if technician:
+            initial_prompt += f"The technician's name is {technician.name} (Phone: {technician.mobile_phone})."
+            if technician.skills:
+                initial_prompt += f" They have skills in: {', '.join(technician.skills.keys())}."
+            if technician.experience_years:
+                initial_prompt += f" They have {technician.experience_years} years of experience."
+        if work_order:
+            required_skills_str = ", ".join(work_order.required_skills) if work_order.required_skills else "various IT skills"
+            initial_prompt += (
+                f" The job is for a {work_order.job_category} role requiring skills in {required_skills_str} "
+                f"in {work_order.job_city}, {work_order.job_state} (ZIP: {work_order.job_zip}). "
+                f"The pay rate is ${work_order.pay_rate} per hour for approximately {work_order.duration_hours} hours. "
+                f"The tentative start date is {work_order.start_date.strftime('%Y-%m-%d') if work_order.start_date else 'a flexible date'}."
+            )
+            initial_prompt += " Be ready to ask about their availability and interest. Do not reveal the full job description unless they ask."
+
+        gemini_response_text = call_gemini_api(initial_prompt)
+        
+        if not gemini_response_text:
+            gemini_response_text = "I am sorry, I am unable to connect you to our AI at this moment."
+            
+        response.say(gemini_response_text)
+        
+        # Store AI's first message in conversation history
+        if call_log:
+            call_log.ai_conversation = f"AI: {gemini_response_text}"
+            db.session.commit()
+
+        # Begin multi-turn conversation with <Gather>
+        # This tells Twilio to listen for speech (or DTMF tones) from the user,
+        # transcribe it, and send it to the 'twilio_handle_response' endpoint.
+        response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
+                                                                               call_log_id=call_log_id), # Pass call_log_id
+                         method='POST')
+        
+        logger.info(f"TwiML generated for CallSid {call_sid}: Spoke Gemini response and started gathering input.")
+        
+    elif call_status == 'ringing':
+        logger.info(f"CallSid {call_sid} is ringing. No TwiML generated yet.")
+        pass # Twilio will continue ringing until answered or timeouts
+    elif call_status in ['busy', 'no-answer', 'failed', 'completed']:
+        logger.info(f"CallSid {call_sid} ended with status: {call_status}. CallLog updated.")
+        # The CallLog status and result are already updated at the top of the webhook.
+        # No further TwiML needed for these terminal statuses.
+    else:
+        logger.warning(f"Webhook received unexpected CallStatus '{call_status}' for CallSid: {call_sid}. No TwiML generated.")
+        
+    return str(response)
+
+# Endpoint for Multi-turn Conversation after initial <Gather>
+@app.route('/twilio_handle_response', methods=['POST'])
+def twilio_handle_response():
+    """
+    This endpoint processes the technician's response (speech/digits)
+    collected by a previous <Gather> verb, sends it to Gemini for the next turn,
+    and generates new TwiML.
+    """
+    call_sid = request.form.get('CallSid')
+    speech_result = request.form.get('SpeechResult') # Transcribed speech from technician
+    
+    logger.info(f"Handling Twilio response for CallSid {call_sid}. Technician's speech: '{speech_result}'")
     
     response = TwiMLResponse()
-    response.say("Thank you for contacting Field Services Nationwide. Your call has been logged.")
-    # You would typically implement more sophisticated IVR or connect to your AI here
+    call_log_id = request.args.get('call_log_id') # Retrieve call_log_id from URL args
+    call_log = CallLog.query.get(call_log_id) if call_log_id else None
+
+    if not call_log:
+        logger.error(f"CallLog not found for CallSid: {call_sid} or call_log_id: {call_log_id}. Ending call.")
+        response.say("I am sorry, there was a problem with our connection. Goodbye.")
+        response.hangup()
+        return str(response)
+
+    # Append technician's speech to conversation history
+    conversation_history = call_log.ai_conversation if call_log.ai_conversation else ""
+    conversation_history += f"\nTechnician: {speech_result}"
+    call_log.ai_conversation = conversation_history
+    db.session.commit() # Save updated history
+
+    technician = Technician.query.get(call_log.technician_id)
+    work_order = WorkOrder.query.get(call_log.campaign.work_order_id)
+
+    # Craft a dynamic prompt for Gemini for the next turn
+    job_info = ""
+    if work_order:
+        required_skills_str = ", ".join(work_order.required_skills) if work_order.required_skills else "various IT skills"
+        job_info = (
+            f"The job is a {work_order.job_category} role in {work_order.job_city}, {work_order.job_state} "
+            f"paying ${work_order.pay_rate} per hour for approximately {work_order.duration_hours} hours. "
+            f"It tentatively starts on {work_order.start_date.strftime('%Y-%m-%d') if work_order.start_date else 'a flexible date'}. "
+            f"Required skills: {required_skills_str}."
+        )
+    
+    # Instruct Gemini on its persona and goals for this turn
+    gemini_prompt = (
+        f"You are an AI job assistant named 'Sarah' from Field Services Nationwide. "
+        f"Your current conversation history is: \n{conversation_history}\n"
+        f"The job opportunity is: {job_info}\n\n"
+        f"Based on the technician's last response, continue the conversation. "
+        f"Your goal is to ascertain their interest ('interested', 'not interested', 'callback', 'unavailable'). "
+        f"You need to ask about their availability for the job and for a human recruiter call. "
+        f"Be polite, concise, and guide the conversation towards determining their interest or availability. "
+        f"If they express clear interest, generate a concluding remark like 'Great! I'll make a note for a human recruiter to call you shortly.' "
+        f"If they say they're not interested, generate a concluding remark like 'Okay, thank you for your time. Goodbye.' "
+        f"If they ask for a callback, say 'Understood, I will inform the recruiter to call you back soon.' "
+        f"If they are clearly unavailable now but not rejecting the job, acknowledge it and suggest a follow-up. "
+        f"Always end your response if they express definitive interest or disinterest."
+    )
+    
+    next_ai_response = call_gemini_api(gemini_prompt)
+    
+    if not next_ai_response:
+        next_ai_response = "I am sorry, I am experiencing a temporary issue. Can you please repeat that?"
+        
+    response.say(next_ai_response)
+    
+    # Update AI conversation in log with Gemini's response
+    call_log.ai_conversation += f"\nAI: {next_ai_response}"
+    
+    # Analyze AI's response to determine if call should end or continue
+    lower_response = next_ai_response.lower()
+    if "great! i'll make a note for a human recruiter" in lower_response or "excellent! a recruiter will reach out" in lower_response:
+        call_log.call_result = 'interested'
+        call_log.call_status = 'completed'
+        response.hangup()
+    elif "thank you for your time. goodbye" in lower_response or "i understand, we'll close this opportunity" in lower_response:
+        call_log.call_result = 'not_interested'
+        call_log.call_status = 'completed'
+        response.hangup()
+    elif "i will inform the recruiter to call you back soon" in lower_response:
+        call_log.call_result = 'callback'
+        call_log.call_status = 'completed'
+        response.hangup()
+    elif "i understand you're unavailable now" in lower_response or "perhaps another time" in lower_response:
+        # If AI indicates understanding of current unavailability but no outright rejection
+        call_log.call_result = 'unavailable'
+        call_log.call_status = 'completed'
+        response.hangup()
+    else:
+        # Continue gathering for next turn if no clear end signal from AI
+        response.gather(input='speech', speechTimeout='auto', action=url_for('twilio_handle_response', _external=True,
+                                                                               call_log_id=call_log_id),
+                         method='POST')
+    
+    db.session.commit() # Save final call result or updated conversation
+    logger.info(f"Generated next TwiML for CallSid {call_sid}. Current Call Result: {call_log.call_result}")
     return str(response)
+
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -1017,30 +1237,6 @@ def health_check():
         'timestamp': datetime.utcnow().isoformat()
     })
 
-# Twilio Voice Webhook placeholder (if actual Twilio calls are used)
-# This will listen for Twilio's POST requests to your app's /twilio_voice_webhook URL
-@app.route('/twilio_voice_webhook', methods=['POST'])
-def twilio_voice_webhook():
-    """
-    This endpoint would receive updates from Twilio during a call.
-    For this simulation, it's just a placeholder.
-    In a real system, you'd parse Twilio's request and update CallLog status/results.
-    """
-    # Parse Twilio's request to get CallSid, CallStatus etc.
-    call_sid = request.form.get('CallSid')
-    call_status = request.form.get('CallStatus') # e.g., 'completed', 'no-answer', 'failed'
-    duration = request.form.get('CallDuration')
-    
-    logger.info(f"Twilio Voice Webhook received update for CallSid: {call_sid}, Status: {call_status}, Duration: {duration}")
-
-    # You would typically find the CallLog entry by twilio_call_sid and update it
-    # For now, this is a basic logging and response.
-    
-    response = TwiMLResponse()
-    response.say("Thank you for contacting Field Services Nationwide. Your call has been logged.")
-    # You would typically implement more sophisticated IVR or connect to your AI here
-    return str(response)
-
 # ==================== MAIN EXECUTION ====================
 
 if __name__ == '__main__':
@@ -1053,3 +1249,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     # In production, debug=False is crucial. Render handles the serving.
     app.run(host='0.0.0.0', port=port, debug=False)
+
