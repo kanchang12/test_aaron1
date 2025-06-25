@@ -32,24 +32,58 @@ except:
     openai_client = None
     logger.error("❌ OpenAI failed")
 
-def generate_ai_response(user_input):
+# Store conversation state
+conversations = {}
+
+def generate_ai_response(user_input, call_sid):
     if not openai_client:
         return "I'm having technical difficulties. A recruiter will call you back soon."
+    
+    # Get conversation history
+    if call_sid not in conversations:
+        conversations[call_sid] = []
+    
+    conversations[call_sid].append(f"User: {user_input}")
+    
+    # Build conversation context
+    context = "\n".join(conversations[call_sid][-6:])  # Last 6 exchanges
     
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are Sarah from Field Services Nationwide. Keep responses under 30 seconds. Be conversational about job opportunities."},
-                {"role": "user", "content": user_input}
+                {"role": "system", "content": """You are Sarah from Field Services Nationwide. You're having a phone conversation about a Senior Network Technician job in Chicago paying $75/hour.
+
+IMPORTANT: Keep the conversation going! Always end with a question or statement that invites a response.
+
+Job details:
+- Position: Senior Network Technician  
+- Location: Chicago, IL
+- Pay: $75/hour
+- Full-time with benefits
+- Requires: Network troubleshooting, router/switch configuration
+- Start date: ASAP
+
+Conversation flow:
+1. If interested → Ask about their experience
+2. If they have experience → Ask about availability  
+3. If available → Get their email and confirm recruiter callback
+4. If not interested → Thank them politely and end
+
+Keep responses under 25 words. Always ask a follow-up question unless they're clearly not interested."""},
+                {"role": "user", "content": f"Conversation so far:\n{context}\n\nUser just said: {user_input}"}
             ],
-            max_tokens=100,
+            max_tokens=80,
             temperature=0.7
         )
-        return response.choices[0].message.content if response.choices else "Let me have a recruiter follow up with you."
+        
+        ai_response = response.choices[0].message.content if response.choices else "Tell me more about your background."
+        conversations[call_sid].append(f"AI: {ai_response}")
+        return ai_response
+        
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        return "A recruiter will call you back within the hour."
+        return "Tell me about your networking experience."
 
 @app.route('/')
 def index():
@@ -93,18 +127,21 @@ def voice_webhook():
     
     response = VoiceResponse()
     
-    welcome = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you interested in hearing more?"
+    welcome = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a Senior Network Technician position in Chicago that pays $75 per hour. Are you interested in hearing more about this opportunity?"
     
     response.say(welcome, voice='alice')
     
+    # Gather speech input
     gather = response.gather(
         input='speech',
-        timeout=10,
+        timeout=12,
+        speech_timeout='auto',
         action='/handle_speech?call_sid=' + call_sid,
         method='POST'
     )
     
-    response.say("I didn't hear a response. Have a great day!")
+    # Fallback if no response
+    response.say("I didn't hear a response. I'll have a recruiter call you back later. Have a great day!")
     response.hangup()
     
     return str(response)
@@ -119,25 +156,40 @@ def handle_speech():
     response = VoiceResponse()
     
     if not speech_result:
+        response.say("I didn't catch that. What's your experience with networking?")
+        # Keep conversation going even if no speech detected
+        gather = response.gather(
+            input='speech',
+            timeout=10,
+            speech_timeout='auto',
+            action='/handle_speech?call_sid=' + call_sid,
+            method='POST'
+        )
         response.say("Thank you for your time!")
         response.hangup()
         return str(response)
     
-    ai_response = generate_ai_response(speech_result)
+    # Generate AI response with conversation context
+    ai_response = generate_ai_response(speech_result, call_sid)
     response.say(ai_response, voice='alice')
     
     user_lower = speech_result.lower()
     
-    if any(word in user_lower for word in ['yes', 'interested', 'tell me']):
+    # Only end conversation if explicitly not interested
+    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop calling', 'remove me', 'not looking']):
+        response.say("No problem! Have a great day!")
+        response.hangup()
+    else:
+        # CONTINUE CONVERSATION - this is the key!
         gather = response.gather(
             input='speech',
-            timeout=8,
+            timeout=15,
+            speech_timeout='auto', 
             action='/handle_speech?call_sid=' + call_sid,
             method='POST'
         )
-        response.say("Thank you for your interest! A recruiter will call you soon.")
-        response.hangup()
-    else:
+        # Fallback only after timeout
+        response.say("Thanks for your time! A recruiter will call you back with next steps.")
         response.hangup()
     
     return str(response)
