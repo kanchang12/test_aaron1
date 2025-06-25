@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Twilio Call Tester - Field Services Nationwide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-gray-50" x-data="callTester()">
+    <div class="min-h-screen py-8">
+        <div class="max-w-4xl mx-auto px-4">
+            <!-- Header -->
+            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                <h1 class="text-3xl font-bold text-gray-800 mb-2">Twilio Call Tester</h1>
+                <p class="text-gray-600">Test AI-powered calling with continuous conversation</p>
+                
+                <!-- Health Status -->
+                <div class="mt-4 flex items-center space-x-4">
+                    <div class="flex items-center">
+                        <div :class="healthStatus.twilio_configured ? 'bg-green-500' : 'bg-red-500'" 
+                             class="w-3 h-3 rounded-full mr-2"></div>
+                        <span class="text-sm text-gray-600">Twilio</span>
+                    </div>
+                    <div class="flex items-center">
+                        <div :class="healthStatus.openai_configured ? 'bg-green-500' : 'bg-red-500'" 
+                             class="w-3 h-3 rounded-full mr-2"></div>
+                        <span class="text-sm text-gray-600">OpenAI</span>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="bg-blue-500 w-3 h-3 rounded-full mr-2"></div>
+                        <span class="text-sm text-gray-600" x-text="`${healthStatus.active_conversations || 0} Active Calls`"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6">
+                <!-- Call Testing Panel -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h2 class="text-xl font-semibold text-gray-800 mb-4">Make Test Call</h2>
+                    
+                    <form @submit.prevent="makeCall()" class="space-y-4">
+                        <div>
+                            <label for="phoneNumber" class="block text-sm font-medium text-gray-700 mb-2">
+                                Phone Number (with country code)
+                            </label>
+                            <input 
+                                type="tel" 
+                                id="phoneNumber"
+                                x-model="phoneNumber"
+                                placeholder="+1234567890"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                required
+                            >
+                            <p class="text-xs text-gray-500 mt-1">Use your own number for testing</p>
+                        </div>
+                        
+                        <button 
+                            type="submit"
+                            :disabled="calling"
+                            :class="calling ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'"
+                            class="w-full text-white font-medium py-2 px-4 rounded-md transition duration-200"
+                        >
+                            <span x-show="!calling">📞 Make Call</span>
+                            <span x-show="calling">📞 Calling...</span>
+                        </button>
+                    </form>
+
+                    <!-- Call Status -->
+                    <div x-show="lastCall" class="mt-6 p-4 bg-gray-50 rounded-md">
+                        <h3 class="text-sm font-medium text-gray-800 mb-2">Last Call Status</h3>
+                        <div x-show="lastCall?.success" class="text-green-600 text-sm">
+                            ✅ Call initiated successfully
+                            <br>Call SID: <span x-text="lastCall?.call_sid" class="font-mono text-xs"></span>
+                        </div>
+                        <div x-show="lastCall && !lastCall?.success" class="text-red-600 text-sm">
+                            ❌ Call failed: <span x-text="lastCall?.error"></span>
+                        </div>
+                    </div>
+
+                    <!-- Instructions -->
+                    <div class="mt-6 p-4 bg-blue-50 rounded-md">
+                        <h3 class="text-sm font-medium text-blue-800 mb-2">📋 Instructions</h3>
+                        <ul class="text-sm text-blue-700 space-y-1">
+                            <li>1. Enter your phone number</li>
+                            <li>2. Click "Make Call" to start</li>
+                            <li>3. Answer the call when it comes</li>
+                            <li>4. Have a conversation with Sarah (AI)</li>
+                            <li>5. Monitor the conversation log below</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Active Conversations -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-xl font-semibold text-gray-800">Active Conversations</h2>
+                        <button 
+                            @click="refreshConversations()"
+                            class="text-blue-600 hover:text-blue-800 text-sm"
+                        >
+                            🔄 Refresh
+                        </button>
+                    </div>
+                    
+                    <div x-show="activeConversations.length === 0" class="text-gray-500 text-center py-8">
+                        No active conversations
+                    </div>
+                    
+                    <div class="space-y-3">
+                        <template x-for="conv in activeConversations" :key="conv.call_sid">
+                            <div class="border border-gray-200 rounded-md p-3">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <span class="text-sm font-medium text-gray-800" 
+                                              x-text="`Call: ${conv.call_sid.slice(-6)}`"></span>
+                                        <span class="text-xs text-gray-500 ml-2" 
+                                              x-text="`${conv.message_count} messages`"></span>
+                                    </div>
+                                    <button 
+                                        @click="viewConversation(conv.call_sid)"
+                                        class="text-blue-600 hover:text-blue-800 text-xs"
+                                    >
+                                        View Details
+                                    </button>
+                                </div>
+                                <div x-show="conv.last_message" class="mt-2 text-xs text-gray-600">
+                                    Last: <span x-text="conv.last_message?.message"></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Conversation Details Modal -->
+            <div x-show="selectedConversation" 
+                 x-transition 
+                 class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+                 @click.away="selectedConversation = null">
+                <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-96 overflow-hidden">
+                    <div class="p-4 border-b border-gray-200">
+                        <div class="flex items-center justify-between">
+                            <h3 class="text-lg font-semibold text-gray-800">
+                                Conversation Details
+                            </h3>
+                            <button @click="selectedConversation = null" class="text-gray-500 hover:text-gray-700">
+                                ✕
+                            </button>
+                        </div>
+                        <p class="text-sm text-gray-600" x-text="`Call SID: ${selectedConversation?.call_sid}`"></p>
+                    </div>
+                    
+                    <div class="p-4 overflow-y-auto max-h-80">
+                        <template x-for="message in selectedConversation?.conversation_history || []">
+                            <div class="mb-3">
+                                <div class="flex items-start space-x-3">
+                                    <div :class="message.speaker === 'AI' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'" 
+                                         class="px-2 py-1 rounded text-xs font-medium">
+                                        <span x-text="message.speaker"></span>
+                                    </div>
+                                    <div class="flex-1">
+                                        <p class="text-sm text-gray-800" x-text="message.message"></p>
+                                        <p class="text-xs text-gray-500 mt-1" x-text="new Date(message.timestamp).toLocaleTimeString()"></p>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Configuration Help -->
+            <div class="mt-8 bg-yellow-50 border border-yellow-200 rounded-lg p-6">
+                <h3 class="text-lg font-semibold text-yellow-800 mb-3">⚙️ Configuration</h3>
+                <div class="text-sm text-yellow-700 space-y-2">
+                    <p><strong>Environment Variables Needed:</strong></p>
+                    <ul class="list-disc list-inside space-y-1 ml-4">
+                        <li><code>TWILIO_ACCOUNT_SID</code> - Your Twilio Account SID</li>
+                        <li><code>TWILIO_AUTH_TOKEN</code> - Your Twilio Auth Token</li>
+                        <li><code>TWILIO_PHONE_NUMBER</code> - Your Twilio phone number</li>
+                        <li><code>OPENAI_API_KEY</code> - Your OpenAI API key</li>
+                    </ul>
+                    <p class="mt-3"><strong>For local testing:</strong></p>
+                    <p>Use <a href="https://ngrok.com" target="_blank" class="underline">ngrok</a> to expose your local server:</p>
+                    <code class="bg-yellow-100 px-2 py-1 rounded">ngrok http 5001</code>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function callTester() {
+            return {
+                phoneNumber: '',
+                calling: false,
+                lastCall: null,
+                activeConversations: [],
+                selectedConversation: null,
+                healthStatus: {
+                    twilio_configured: false,
+                    openai_configured: false,
+                    active_conversations: 0
+                },
+                
+                init() {
+                    this.checkHealth();
+                    this.refreshConversations();
+                    
+                    // Auto-refresh every 5 seconds
+                    setInterval(() => {
+                        this.checkHealth();
+                        this.refreshConversations();
+                    }, 5000);
+                },
+                
+                async checkHealth() {
+                    try {
+                        const response = await fetch('/health');
+                        this.healthStatus = await response.json();
+                    } catch (error) {
+                        console.error('Health check failed:', error);
+                    }
+                },
+                
+                async makeCall() {
+                    if (!this.phoneNumber.trim()) {
+                        alert('Please enter a phone number');
+                        return;
+                    }
+                    
+                    this.calling = true;
+                    this.lastCall = null;
+                    
+                    try {
+                        const response = await fetch('/make_test_call', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                phone_number: this.phoneNumber
+                            })
+                        });
+                        
+                        const result = await response.json();
+                        this.lastCall = result;
+                        
+                        if (result.success) {
+                            // Auto-refresh conversations to show the new call
+                            setTimeout(() => this.refreshConversations(), 2000);
+                        }
+                        
+                    } catch (error) {
+                        this.lastCall = {
+                            success: false,
+                            error: error.message
+                        };
+                    } finally {
+                        this.calling = false;
+                    }
+                },
+                
+                async refreshConversations() {
+                    try {
+                        const response = await fetch('/active_conversations');
+                        const data = await response.json();
+                        this.activeConversations = data.active_conversations || [];
+                    } catch (error) {
+                        console.error('Failed to refresh conversations:', error);
+                    }
+                },
+                
+                async viewConversation(callSid) {
+                    try {
+                        const response = await fetch(`/get_conversation/${callSid}`);
+                        this.selectedConversation = await response.json();
+                    } catch (error) {
+                        console.error('Failed to get conversation:', error);
+                        alert('Failed to load conversation details');
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
