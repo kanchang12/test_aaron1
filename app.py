@@ -17,8 +17,8 @@ TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 
-# ElevenLabs voice with fast settings
-VOICE_CONFIG = "g6xIsTj2HwM6VR4iXFCw-turbo_v2_5-1.1_0.5_0.8"  # Fast, clear voice
+# ElevenLabs voice - EXACT voice you want, natural settings
+VOICE_CONFIG = "g6xIsTj2HwM6VR4iXFCw-turbo_v2_5-0.9_0.7_0.9"  # Natural speed, stable, similar
 
 # Initialize clients
 try:
@@ -39,44 +39,28 @@ except:
 conversations = {}
 
 def generate_ai_response(user_input, call_sid):
-    if not openai_client:
-        return "I'm having technical difficulties."
+    # Pre-built fast responses - no API delay!
+    responses = {
+        'interested': "Great! How many years experience do you have?",
+        'yes': "Awesome! What's your networking background?", 
+        'experience': "Perfect! Are you available to start soon?",
+        'available': "Excellent! What's your email address?",
+        'email': "Thanks! Recruiter calls you tomorrow morning!",
+        'default': "Tell me about your experience?"
+    }
     
-    # Get conversation history
-    if call_sid not in conversations:
-        conversations[call_sid] = []
+    user_lower = user_input.lower()
     
-    conversations[call_sid].append(f"User: {user_input}")
-    
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": """You are Sarah from Field Services. Quick phone conversation about a $75/hour network tech job in Chicago.
-
-CRITICAL: Keep responses under 12 words max. Be fast and direct.
-
-Flow:
-- Interested? → "Great! How many years networking experience?"
-- Experience given → "Perfect! Available to start soon?"  
-- Available → "Awesome! What's your email?"
-- Email given → "Thanks! Recruiter calls tomorrow!"
-- Not interested → "No problem, bye!"
-
-Be conversational but FAST. One quick question per response."""},
-                {"role": "user", "content": user_input}
-            ],
-            max_tokens=25,  # Very short responses
-            temperature=0.3  # More focused
-        )
-        
-        ai_response = response.choices[0].message.content if response.choices else "Tell me your experience?"
-        conversations[call_sid].append(f"AI: {ai_response}")
-        return ai_response
-        
-    except Exception as e:
-        logger.error(f"OpenAI error: {e}")
-        return "What's your networking background?"
+    if any(word in user_lower for word in ['interested', 'yes', 'sure', 'tell me']):
+        return responses['interested']
+    elif any(word in user_lower for word in ['year', 'experience', 'network', 'tech']):
+        return responses['available']
+    elif any(word in user_lower for word in ['available', 'start', 'soon', 'ready']):
+        return responses['email']
+    elif '@' in user_lower or 'email' in user_lower:
+        return responses['email']
+    else:
+        return responses['default']
 
 @app.route('/')
 def index():
@@ -120,22 +104,21 @@ def voice_webhook():
     
     response = VoiceResponse()
     
-    welcome = "Hi! Sarah from Field Services. Network tech job, 75 per hour, Chicago. Interested?"
+    welcome = "Hi! This is Sarah from Field Services. I have a network technician job in Chicago paying seventy five dollars per hour. Are you interested?"
     
-    # Use ElevenLabs voice directly through Twilio - MUCH FASTER!
-    response.say(welcome, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+    # Use JUST your voice ID - let ElevenLabs use default natural settings
+    response.say(welcome, ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
     
-    # Gather speech input with shorter timeout for speed
+    # Minimal timeout for instant response
     gather = response.gather(
         input='speech',
-        timeout=6,
-        speech_timeout='auto',
+        timeout=4,
+        speech_timeout=2,
         action='/handle_speech?call_sid=' + call_sid,
         method='POST'
     )
     
-    # Quick fallback
-    response.say("Call you back!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+    response.say("I'll call back later!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
     response.hangup()
     
     return str(response)
@@ -149,45 +132,28 @@ def handle_speech():
     
     response = VoiceResponse()
     
-    if not speech_result:
-        quick_response = "What's your experience?"
-        response.say(quick_response, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
-            
-        gather = response.gather(
-            input='speech',
-            timeout=5,
-            speech_timeout='auto',
-            action='/handle_speech?call_sid=' + call_sid,
-            method='POST'
-        )
-        response.say("Thanks!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
-        response.hangup()
-        return str(response)
-    
-    # Generate FAST AI response
+    # INSTANT response - no delays!
     ai_response = generate_ai_response(speech_result, call_sid)
     
-    # Use ElevenLabs voice through Twilio - FAST!
-    response.say(ai_response, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+    # Use your exact voice ID with no modifications
+    response.say(ai_response, ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
     
     user_lower = speech_result.lower()
     
     # Only end if explicitly not interested
-    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop', 'remove me', 'busy']):
-        goodbye = "No problem, bye!"
-        response.say(goodbye, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop', 'remove', 'busy']):
+        response.say("No problem! Have a great day!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
         response.hangup()
     else:
-        # Continue conversation with shorter timeout for speed
+        # Continue with minimal timeout
         gather = response.gather(
             input='speech',
-            timeout=6,
-            speech_timeout='auto', 
+            timeout=4,
+            speech_timeout=2,
             action='/handle_speech?call_sid=' + call_sid,
             method='POST'
         )
-        # Quick fallback
-        response.say("Recruiter will call!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+        response.say("Thanks for your time!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
         response.hangup()
     
     return str(response)
