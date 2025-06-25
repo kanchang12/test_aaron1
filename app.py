@@ -3,7 +3,7 @@ import os
 import logging
 from flask import Flask, request, jsonify, render_template
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect
 from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +16,9 @@ TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+
+# ElevenLabs voice with fast settings
+VOICE_CONFIG = "g6xIsTj2HwM6VR4iXFCw-turbo_v2_5-1.1_0.5_0.8"  # Fast, clear voice
 
 # Initialize clients
 try:
@@ -37,7 +40,7 @@ conversations = {}
 
 def generate_ai_response(user_input, call_sid):
     if not openai_client:
-        return "I'm having technical difficulties. A recruiter will call you back soon."
+        return "I'm having technical difficulties."
     
     # Get conversation history
     if call_sid not in conversations:
@@ -45,45 +48,35 @@ def generate_ai_response(user_input, call_sid):
     
     conversations[call_sid].append(f"User: {user_input}")
     
-    # Build conversation context
-    context = "\n".join(conversations[call_sid][-6:])  # Last 6 exchanges
-    
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": """You are Sarah from Field Services Nationwide. You're having a phone conversation about a Senior Network Technician job in Chicago paying $75/hour.
+                {"role": "system", "content": """You are Sarah from Field Services. Quick phone conversation about a $75/hour network tech job in Chicago.
 
-IMPORTANT: Keep the conversation going! Always end with a question or statement that invites a response.
+CRITICAL: Keep responses under 12 words max. Be fast and direct.
 
-Job details:
-- Position: Senior Network Technician  
-- Location: Chicago, IL
-- Pay: $75/hour
-- Full-time with benefits
-- Requires: Network troubleshooting, router/switch configuration
-- Start date: ASAP
+Flow:
+- Interested? → "Great! How many years networking experience?"
+- Experience given → "Perfect! Available to start soon?"  
+- Available → "Awesome! What's your email?"
+- Email given → "Thanks! Recruiter calls tomorrow!"
+- Not interested → "No problem, bye!"
 
-Conversation flow:
-1. If interested → Ask about their experience
-2. If they have experience → Ask about availability  
-3. If available → Get their email and confirm recruiter callback
-4. If not interested → Thank them politely and end
-
-Keep responses under 25 words. Always ask a follow-up question unless they're clearly not interested."""},
-                {"role": "user", "content": f"Conversation so far:\n{context}\n\nUser just said: {user_input}"}
+Be conversational but FAST. One quick question per response."""},
+                {"role": "user", "content": user_input}
             ],
-            max_tokens=80,
-            temperature=0.7
+            max_tokens=25,  # Very short responses
+            temperature=0.3  # More focused
         )
         
-        ai_response = response.choices[0].message.content if response.choices else "Tell me more about your background."
+        ai_response = response.choices[0].message.content if response.choices else "Tell me your experience?"
         conversations[call_sid].append(f"AI: {ai_response}")
         return ai_response
         
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        return "Tell me about your networking experience."
+        return "What's your networking background?"
 
 @app.route('/')
 def index():
@@ -127,21 +120,22 @@ def voice_webhook():
     
     response = VoiceResponse()
     
-    welcome = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a Senior Network Technician position in Chicago that pays $75 per hour. Are you interested in hearing more about this opportunity?"
+    welcome = "Hi! Sarah from Field Services. Network tech job, 75 per hour, Chicago. Interested?"
     
-    response.say(welcome, voice='alice')
+    # Use ElevenLabs voice directly through Twilio - MUCH FASTER!
+    response.say(welcome, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
     
-    # Gather speech input
+    # Gather speech input with shorter timeout for speed
     gather = response.gather(
         input='speech',
-        timeout=12,
+        timeout=6,
         speech_timeout='auto',
         action='/handle_speech?call_sid=' + call_sid,
         method='POST'
     )
     
-    # Fallback if no response
-    response.say("I didn't hear a response. I'll have a recruiter call you back later. Have a great day!")
+    # Quick fallback
+    response.say("Call you back!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
     response.hangup()
     
     return str(response)
@@ -156,40 +150,44 @@ def handle_speech():
     response = VoiceResponse()
     
     if not speech_result:
-        response.say("I didn't catch that. What's your experience with networking?")
-        # Keep conversation going even if no speech detected
+        quick_response = "What's your experience?"
+        response.say(quick_response, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
+            
         gather = response.gather(
             input='speech',
-            timeout=10,
+            timeout=5,
             speech_timeout='auto',
             action='/handle_speech?call_sid=' + call_sid,
             method='POST'
         )
-        response.say("Thank you for your time!")
+        response.say("Thanks!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
         response.hangup()
         return str(response)
     
-    # Generate AI response with conversation context
+    # Generate FAST AI response
     ai_response = generate_ai_response(speech_result, call_sid)
-    response.say(ai_response, voice='alice')
+    
+    # Use ElevenLabs voice through Twilio - FAST!
+    response.say(ai_response, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
     
     user_lower = speech_result.lower()
     
-    # Only end conversation if explicitly not interested
-    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop calling', 'remove me', 'not looking']):
-        response.say("No problem! Have a great day!")
+    # Only end if explicitly not interested
+    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop', 'remove me', 'busy']):
+        goodbye = "No problem, bye!"
+        response.say(goodbye, ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
         response.hangup()
     else:
-        # CONTINUE CONVERSATION - this is the key!
+        # Continue conversation with shorter timeout for speed
         gather = response.gather(
             input='speech',
-            timeout=15,
+            timeout=6,
             speech_timeout='auto', 
             action='/handle_speech?call_sid=' + call_sid,
             method='POST'
         )
-        # Fallback only after timeout
-        response.say("Thanks for your time! A recruiter will call you back with next steps.")
+        # Quick fallback
+        response.say("Recruiter will call!", ttsProvider="ElevenLabs", voice=VOICE_CONFIG)
         response.hangup()
     
     return str(response)
