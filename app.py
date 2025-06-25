@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Field Services Nationwide - AI Calling System
-Main Flask Application - OpenAI VERSION
+Main Flask Application - FIXED VERSION
 """
 
 import os
@@ -16,7 +16,9 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from twilio.rest import Client 
 from twilio.twiml.voice_response import VoiceResponse as TwiMLResponse, Say, Gather, Hangup 
-import requests
+
+# FIXED: Use official OpenAI client instead of direct HTTP requests
+from openai import OpenAI
 
 import sqlalchemy 
 
@@ -51,14 +53,29 @@ login_manager.login_view = 'login'
 login_manager.login_message = 'Please log in to access this page.'
 login_manager.login_message_category = 'info'
 
-# Configuration - CHANGED TO OPENAI
+# Configuration - FIXED: Proper OpenAI client initialization
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 
-# Initialize clients
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
+# Initialize clients - FIXED: Proper error handling
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
+    if not twilio_client:
+        logger.warning("Twilio client not initialized - missing credentials")
+except Exception as e:
+    logger.error(f"Failed to initialize Twilio client: {e}")
+    twilio_client = None
+
+try:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    if not openai_client:
+        logger.warning("OpenAI client not initialized - missing API key")
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    openai_client = None
+
 geolocator = Nominatim(user_agent="fsn_calling_system")
 
 # ==================== DATABASE MODELS ====================
@@ -169,7 +186,10 @@ class CallLog(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    try:
+        return User.query.get(int(user_id))
+    except:
+        return None
 
 # ==================== FORMS ====================
 
@@ -220,75 +240,63 @@ class WorkOrderForm(FlaskForm):
     background_check = BooleanField('Background Check Required')
     min_experience = IntegerField('Minimum Experience (years)', validators=[NumberRange(min=0, max=30)], default=0)
 
-# ==================== OPENAI INTEGRATION ====================
+# ==================== OPENAI INTEGRATION - FIXED ====================
 
 def call_openai_api(prompt, model="gpt-4o-mini"):
     """
-    Calls the OpenAI API to generate text based on a prompt.
+    FIXED: Uses the official OpenAI client instead of manual HTTP requests
     """
-    if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY is not set. Cannot call OpenAI API. Using fallback message.")
-        return "I am sorry, I cannot generate a response right now due to an internal configuration issue."
-
-    api_url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {OPENAI_API_KEY}'
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Sarah, a professional AI assistant from Field Services Nationwide. Keep responses conversational, under 30 seconds when spoken, and focused on determining job interest and availability."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "max_tokens": 150,
-        "temperature": 0.7
-    }
+    if not openai_client:
+        logger.error("OpenAI client is not initialized. Cannot call OpenAI API.")
+        return "I'm sorry, I cannot generate a response right now due to a configuration issue."
 
     try:
         logger.info(f"Calling OpenAI API with prompt: '{prompt[:100]}...'")
-        response = requests.post(api_url, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
         
-        json_response = response.json()
+        response = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are Sarah, a professional AI assistant from Field Services Nationwide. Keep responses conversational, under 30 seconds when spoken, and focused on determining job interest and availability."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            max_tokens=150,
+            temperature=0.7
+        )
         
-        if json_response and json_response.get('choices'):
-            generated_text = json_response['choices'][0]['message']['content']
+        if response and response.choices:
+            generated_text = response.choices[0].message.content
             logger.info(f"OpenAI API response (first 100 chars): '{generated_text[:100]}...'")
             return generated_text
         else:
-            logger.warning(f"OpenAI API returned no choices or unexpected format: {json_response}")
-            return "I am sorry, I couldn't generate a coherent response from the AI."
-    except requests.exceptions.Timeout:
-        logger.error("OpenAI API call timed out.")
-        return "I am sorry, the AI is taking too long to respond. Please try again."
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling OpenAI API: {e}")
-        return f"I am sorry, there was a problem with the AI service: {str(e)}"
+            logger.warning("OpenAI API returned no choices or unexpected format")
+            return "I'm sorry, I couldn't generate a coherent response."
+            
     except Exception as e:
-        logger.error(f"Unexpected error processing OpenAI API response: {e}")
-        return "I am sorry, an unexpected internal error occurred with the AI."
+        logger.error(f"Error calling OpenAI API: {e}")
+        return "I'm sorry, there was a problem with the AI service. Please try again."
 
 # ==================== HELPER FUNCTIONS ====================
 
 def get_coordinates(address_string):
-    """Fixed geocoding function that forces US locations only."""
+    """FIXED: Better error handling for geocoding."""
     try:
         if not address_string or pd.isna(address_string):
             return None, None
         
         # Clean the address string
         address_string = str(address_string).strip()
+        if not address_string:
+            return None, None
         
         # FORCE US-ONLY by adding country code
         if ", USA" not in address_string and ", US" not in address_string:
-            if address_string.replace('.', '').isdigit():
+            if address_string.replace('.', '').replace('-', '').isdigit():
                 # Just a zip code
                 address_string = f"{address_string}, USA"
             else:
@@ -310,7 +318,7 @@ def get_coordinates(address_string):
         return None, None
 
 def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None):
-    """Fixed qualification check with better error handling."""
+    """FIXED: Better error handling and session management."""
     if exclude_called_ids is None:
         exclude_called_ids = []
     
@@ -326,11 +334,13 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
 
         qualified_pool = []
         potential_technicians_data = []
-        work_order_location = (work_order.job_latitude, work_order.job_longitude)
         
+        # FIXED: Check for valid work order coordinates first
         if not work_order.job_latitude or not work_order.job_longitude:
             logger.error(f"Work Order {work_order.work_order_id} has no valid coordinates.")
             return [], []
+            
+        work_order_location = (work_order.job_latitude, work_order.job_longitude)
         
         for tech in all_techs:
             is_qualified = True
@@ -433,13 +443,13 @@ def find_qualified_technicians(work_order, radius_miles, exclude_called_ids=None
         return [], []
 
 def make_ai_call(campaign, tech_data):
-    """Fixed AI call function with better error handling."""
+    """FIXED: Better error handling and session management."""
     tech = tech_data['technician']
     
     logger.info(f"Making call to {tech.name} ({tech.mobile_phone})")
     
     try:
-        # Create call log
+        # Create call log with better error handling
         call_log = CallLog(
             campaign_id=campaign.id,
             technician_id=tech.id,
@@ -448,8 +458,13 @@ def make_ai_call(campaign, tech_data):
             distance_miles=tech_data['distance']
         )
         
-        db.session.add(call_log)
-        db.session.commit()
+        try:
+            db.session.add(call_log)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Failed to create call log: {e}")
+            raise
 
         # Make Twilio call
         if twilio_client and TWILIO_PHONE_NUMBER:
@@ -457,7 +472,9 @@ def make_ai_call(campaign, tech_data):
                 call = twilio_client.calls.create(
                     url=url_for('twilio_voice_webhook', _external=True, call_log_id=call_log.id),
                     to=tech.mobile_phone,
-                    from_=TWILIO_PHONE_NUMBER
+                    from_=TWILIO_PHONE_NUMBER,
+                    timeout=30,  # FIXED: Add timeout
+                    record=False  # FIXED: Disable recording for privacy
                 )
                 call_log.twilio_call_sid = call.sid
                 call_log.call_status = 'ringing'
@@ -507,6 +524,10 @@ def make_ai_call(campaign, tech_data):
         
     except Exception as e:
         logger.error(f"Error making call to {tech.name}: {e}")
+        try:
+            db.session.rollback()
+        except:
+            pass
         return {
             'technician_id': tech.id,
             'name': tech.name,
@@ -530,103 +551,123 @@ def index():
         logger.error(f"Error updating last login: {e}")
         db.session.rollback()
 
-    if current_user.is_admin():
-        recent_orders = WorkOrder.query.order_by(WorkOrder.created_at.desc()).limit(5).all()
-        campaign_query = CallCampaign.query.filter_by(status='active')
-    else:
-        recent_orders = WorkOrder.query.filter_by(created_by=current_user.id).order_by(WorkOrder.created_at.desc()).limit(5).all()
-        work_order_ids = [wo.id for wo in WorkOrder.query.filter_by(created_by=current_user.id).all()]
-        campaign_query = CallCampaign.query.filter_by(status='active').filter(CallCampaign.work_order_id.in_(work_order_ids))
-    
-    active_campaigns = campaign_query.all()
-    
-    stats = {
-        'total_technicians': Technician.query.filter_by(is_active=True).count(),
-        'total_work_orders': len(recent_orders),
-        'active_campaigns': len(active_campaigns),
-        'total_calls': CallLog.query.count()
-    }
-    
-    return render_template('dashboard.html', 
-                           recent_orders=recent_orders,
-                           active_campaigns=active_campaigns,
-                           stats=stats)
+    try:
+        if current_user.is_admin():
+            recent_orders = WorkOrder.query.order_by(WorkOrder.created_at.desc()).limit(5).all()
+            campaign_query = CallCampaign.query.filter_by(status='active')
+        else:
+            recent_orders = WorkOrder.query.filter_by(created_by=current_user.id).order_by(WorkOrder.created_at.desc()).limit(5).all()
+            work_order_ids = [wo.id for wo in WorkOrder.query.filter_by(created_by=current_user.id).all()]
+            campaign_query = CallCampaign.query.filter_by(status='active').filter(CallCampaign.work_order_id.in_(work_order_ids))
+        
+        active_campaigns = campaign_query.all()
+        
+        stats = {
+            'total_technicians': Technician.query.filter_by(is_active=True).count(),
+            'total_work_orders': len(recent_orders),
+            'active_campaigns': len(active_campaigns),
+            'total_calls': CallLog.query.count()
+        }
+        
+        return render_template('dashboard.html', 
+                               recent_orders=recent_orders,
+                               active_campaigns=active_campaigns,
+                               stats=stats)
+    except Exception as e:
+        logger.error(f"Error in index route: {e}")
+        flash('Error loading dashboard. Please try again.', 'error')
+        return render_template('dashboard.html', recent_orders=[], active_campaigns=[], stats={})
 
 @app.route('/twilio_voice_webhook', methods=['GET', 'POST'])
 def twilio_voice_webhook():
+    """FIXED: Better error handling for Twilio webhooks."""
     call_log_id = request.args.get('call_log_id')
     
-    if request.method == 'GET':
-        # Call answered - provide TwiML with OpenAI
-        logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
-        response = TwiMLResponse()
-        
-        # Get context for AI
-        if call_log_id:
-            call_log = CallLog.query.get(call_log_id)
-            if call_log:
-                technician = Technician.query.get(call_log.technician_id)
-                campaign = CallCampaign.query.get(call_log.campaign_id)
-                work_order = campaign.work_order if campaign else None
-                
-                # Build AI prompt with context
-                initial_prompt = (
-                    "Introduce yourself as Sarah from Field Services Nationwide. "
-                    "You're calling about a job opportunity. Keep it brief and ask if they're available to chat. "
-                )
-                
-                if technician and work_order:
-                    required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
-                    initial_prompt += (
-                        f"The technician's name is {technician.name}. "
-                        f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
-                        f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
-                    )
-                
-                ai_response = call_openai_api(initial_prompt)
-                if not ai_response:
-                    ai_response = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?"
-                
-                call_log.ai_conversation = f"AI: {ai_response}"
-                db.session.commit()
-                
-                response.say(ai_response)
+    try:
+        if request.method == 'GET':
+            # Call answered - provide TwiML with OpenAI
+            logger.info(f"Call answered - providing TwiML for call_log_id: {call_log_id}")
+            response = TwiMLResponse()
+            
+            # Get context for AI
+            if call_log_id:
+                try:
+                    call_log = CallLog.query.get(call_log_id)
+                    if call_log:
+                        technician = Technician.query.get(call_log.technician_id)
+                        campaign = CallCampaign.query.get(call_log.campaign_id)
+                        work_order = campaign.work_order if campaign else None
+                        
+                        # Build AI prompt with context
+                        initial_prompt = (
+                            "Introduce yourself as Sarah from Field Services Nationwide. "
+                            "You're calling about a job opportunity. Keep it brief and ask if they're available to chat. "
+                        )
+                        
+                        if technician and work_order:
+                            required_skills = ", ".join(work_order.required_skills) if work_order.required_skills else "IT skills"
+                            initial_prompt += (
+                                f"The technician's name is {technician.name}. "
+                                f"The job is {work_order.job_category} in {work_order.job_city}, {work_order.job_state} "
+                                f"paying ${work_order.pay_rate}/hour requiring {required_skills}. "
+                            )
+                        
+                        ai_response = call_openai_api(initial_prompt)
+                        if not ai_response:
+                            ai_response = "Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?"
+                        
+                        call_log.ai_conversation = f"AI: {ai_response}"
+                        db.session.commit()
+                        
+                        response.say(ai_response, voice='alice')
+                    else:
+                        response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.", voice='alice')
+                except Exception as e:
+                    logger.error(f"Error getting call context: {e}")
+                    response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.", voice='alice')
             else:
-                response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity.")
-        else:
-            response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?")
+                response.say("Hello! This is Sarah from Field Services Nationwide. I'm calling about a job opportunity. Are you available to chat?", voice='alice')
+            
+            # FIXED: Better gather configuration
+            response.gather(
+                input='speech',
+                speech_timeout='auto',
+                timeout=10,
+                action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
+                method='POST'
+            )
+            return str(response)
         
-        response.gather(
-            input='speech',
-            speechTimeout='auto',
-            action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-            method='POST',
-            actionOnEmptyResult=True
-        )
-        return str(response)
-    
-    else:  # POST - status updates
-        call_sid = request.form.get('CallSid')
-        call_status = request.form.get('CallStatus')
-        logger.info(f"Status update: CallSid={call_sid}, Status={call_status}")
-        
-        # Update call log status
-        if call_log_id and call_status in ['answered', 'completed', 'busy', 'no-answer', 'failed']:
-            try:
-                call_log = CallLog.query.get(call_log_id)
-                if call_log:
-                    call_log.call_status = call_status
-                    db.session.commit()
-            except Exception as e:
-                logger.error(f"Error updating call status: {e}")
-                db.session.rollback()
-        
-        return '', 200
+        else:  # POST - status updates
+            call_sid = request.form.get('CallSid')
+            call_status = request.form.get('CallStatus')
+            logger.info(f"Status update: CallSid={call_sid}, Status={call_status}")
+            
+            # Update call log status
+            if call_log_id and call_status in ['answered', 'completed', 'busy', 'no-answer', 'failed']:
+                try:
+                    call_log = CallLog.query.get(call_log_id)
+                    if call_log:
+                        call_log.call_status = call_status
+                        db.session.commit()
+                except Exception as e:
+                    logger.error(f"Error updating call status: {e}")
+                    db.session.rollback()
+            
+            return '', 200
+            
+    except Exception as e:
+        logger.error(f"Error in twilio_voice_webhook: {e}")
+        error_response = TwiMLResponse()
+        error_response.say("Sorry, there was a technical issue. Please try again later.", voice='alice')
+        error_response.hangup()
+        return str(error_response)
 
 @app.route('/twilio_handle_response', methods=['POST'])
 def twilio_handle_response():
+    """FIXED: Better conversation handling."""
     call_sid = request.form.get('CallSid')
-    speech_result = request.form.get('SpeechResult', '')
+    speech_result = request.form.get('SpeechResult', '').strip()
     call_log_id = request.args.get('call_log_id')
     
     logger.info(f"Speech from {call_sid}: '{speech_result}'")
@@ -662,7 +703,7 @@ def twilio_handle_response():
                 if not ai_response:
                     ai_response = "Thank you for your time. A recruiter will contact you soon if you're interested."
                 
-                response.say(ai_response)
+                response.say(ai_response, voice='alice')
                 
                 # Update conversation
                 conversation += f"\nAI: {ai_response}"
@@ -670,36 +711,47 @@ def twilio_handle_response():
                 
                 # Check if conversation should end
                 lower_response = ai_response.lower()
+                lower_speech = speech_result.lower()
                 should_end = any(phrase in lower_response for phrase in [
                     "goodbye", "thank you for your time", "recruiter will call", "not interested"
+                ]) or any(phrase in lower_speech for phrase in [
+                    "not interested", "no thanks", "goodbye", "hang up"
                 ])
                 
                 if should_end:
-                    if "recruiter will call" in lower_response or "interested" in speech_result.lower():
+                    if "recruiter will call" in lower_response or "interested" in lower_speech:
                         call_log.call_result = 'interested'
                         # Update campaign responses
-                        campaign.current_responses += 1
+                        try:
+                            campaign.current_responses += 1
+                            db.session.commit()
+                        except:
+                            db.session.rollback()
                     else:
                         call_log.call_result = 'not_interested'
                     
                     call_log.call_status = 'completed'
+                    db.session.commit()
                     response.hangup()
                 else:
                     # Continue conversation
                     response.gather(
                         input='speech',
-                        speechTimeout='auto',
+                        speech_timeout='auto',
+                        timeout=10,
                         action=url_for('twilio_handle_response', _external=True, call_log_id=call_log_id),
-                        method='POST',
-                        actionOnEmptyResult=True
+                        method='POST'
                     )
-                
-                db.session.commit()
+                    db.session.commit()
         
     except Exception as e:
         logger.error(f"Error in handle_response: {e}")
-        response.say("Thank you for your time. Have a great day!")
+        response.say("Thank you for your time. Have a great day!", voice='alice')
         response.hangup()
+        try:
+            db.session.rollback()
+        except:
+            pass
     
     return str(response)
 
@@ -710,15 +762,19 @@ def login():
     
     form = LoginForm()
     if form.validate_on_submit():
-        user = User.query.filter_by(username=form.username.data).first()
-        
-        if user and user.check_password(form.password.data) and user.is_active:
-            login_user(user, remember=True)
-            flash('Login successful!', 'success')
-            next_page = request.args.get('next')
-            return redirect(next_page) if next_page else redirect(url_for('index'))
-        else:
-            flash('Invalid username or password!', 'error')
+        try:
+            user = User.query.filter_by(username=form.username.data).first()
+            
+            if user and user.check_password(form.password.data) and user.is_active:
+                login_user(user, remember=True)
+                flash('Login successful!', 'success')
+                next_page = request.args.get('next')
+                return redirect(next_page) if next_page else redirect(url_for('index'))
+            else:
+                flash('Invalid username or password!', 'error')
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            flash('Login failed. Please try again.', 'error')
     
     return render_template('auth/login.html', form=form)
 
@@ -729,28 +785,33 @@ def register():
     
     form = RegisterForm()
     if form.validate_on_submit():
-        if User.query.filter_by(username=form.username.data).first():
-            flash('Username already exists!', 'error')
-            return render_template('auth/register.html', form=form)
-        
-        if User.query.filter_by(email=form.email.data).first():
-            flash('Email already registered!', 'error')
-            return render_template('auth/register.html', form=form)
-        
-        user = User(
-            username=form.username.data,
-            email=form.email.data,
-            company_name=form.company_name.data,
-            phone=form.phone.data,
-            role='sub_account'
-        )
-        user.set_password(form.password.data)
-        
-        db.session.add(user)
-        db.session.commit()
-        
-        flash('Registration successful! Please log in.', 'success')
-        return redirect(url_for('login'))
+        try:
+            if User.query.filter_by(username=form.username.data).first():
+                flash('Username already exists!', 'error')
+                return render_template('auth/register.html', form=form)
+            
+            if User.query.filter_by(email=form.email.data).first():
+                flash('Email already registered!', 'error')
+                return render_template('auth/register.html', form=form)
+            
+            user = User(
+                username=form.username.data,
+                email=form.email.data,
+                company_name=form.company_name.data,
+                phone=form.phone.data,
+                role='sub_account'
+            )
+            user.set_password(form.password.data)
+            
+            db.session.add(user)
+            db.session.commit()
+            
+            flash('Registration successful! Please log in.', 'success')
+            return redirect(url_for('login'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Registration error: {e}")
+            flash('Registration failed. Please try again.', 'error')
     
     return render_template('auth/register.html', form=form)
 
@@ -813,23 +874,28 @@ def create_work_order():
 @app.route('/start_campaign/<int:work_order_id>')
 @login_required
 def start_campaign(work_order_id):
-    work_order = WorkOrder.query.get_or_404(work_order_id)
-    
-    if not current_user.is_admin() and work_order.created_by != current_user.id:
-        flash('Access denied!', 'error')
+    try:
+        work_order = WorkOrder.query.get_or_404(work_order_id)
+        
+        if not current_user.is_admin() and work_order.created_by != current_user.id:
+            flash('Access denied!', 'error')
+            return redirect(url_for('index'))
+        
+        existing_campaign = CallCampaign.query.filter_by(work_order_id=work_order.id, status='active').first()
+        if existing_campaign:
+            flash(f'Campaign for Work Order {work_order.work_order_id} is already active!', 'info')
+            return redirect(url_for('campaign_dashboard', campaign_id=existing_campaign.id))
+        
+        campaign = CallCampaign(work_order_id=work_order.id, target_responses=5)
+        db.session.add(campaign)
+        db.session.commit()
+        
+        flash('Campaign started successfully!', 'success')
+        return redirect(url_for('campaign_dashboard', campaign_id=campaign.id))
+    except Exception as e:
+        logger.error(f"Error starting campaign: {e}")
+        flash('Error starting campaign. Please try again.', 'error')
         return redirect(url_for('index'))
-    
-    existing_campaign = CallCampaign.query.filter_by(work_order_id=work_order.id, status='active').first()
-    if existing_campaign:
-        flash(f'Campaign for Work Order {work_order.work_order_id} is already active!', 'info')
-        return redirect(url_for('campaign_dashboard', campaign_id=existing_campaign.id))
-    
-    campaign = CallCampaign(work_order_id=work_order.id, target_responses=5)
-    db.session.add(campaign)
-    db.session.commit()
-    
-    flash('Campaign started successfully!', 'success')
-    return redirect(url_for('campaign_dashboard', campaign_id=campaign.id))
 
 @app.route('/campaign/<int:campaign_id>')
 @login_required
@@ -967,7 +1033,7 @@ def api_start_calling(campaign_id):
         
         # Get request data safely
         request_data = request.get_json() or {}
-        batch_size = request_data.get('batch_size', 5)
+        batch_size = min(request_data.get('batch_size', 5), 10)  # FIXED: Limit batch size
         
         logger.info(f"Starting calling for campaign {campaign_id}, batch size: {batch_size}")
         
@@ -1036,7 +1102,7 @@ def api_expand_radius(campaign_id):
             return jsonify({'error': 'Access denied'}), 403
         
         request_data = request.get_json() or {}
-        expansion = request_data.get('expansion_miles', 20)
+        expansion = min(request_data.get('expansion_miles', 20), 50)  # FIXED: Limit expansion
         
         campaign.current_radius += expansion
         db.session.commit()
@@ -1066,7 +1132,7 @@ def api_expand_radius(campaign_id):
 # ==================== IMPORT FUNCTION ====================
 
 def import_technicians_from_df(df):
-    """Fixed technician import with better geocoding."""
+    """FIXED: Better error handling and session management for import."""
     imported_count = 0
     
     expected_columns = [
@@ -1097,7 +1163,7 @@ def import_technicians_from_df(df):
             # Check for existing technician
             existing_tech = Technician.query.filter(
                 (Technician.mobile_phone == mobile_phone) |
-                (Technician.email == email if email else False)
+                ((Technician.email == email) if email else False)
             ).first()
 
             if existing_tech:
@@ -1121,7 +1187,7 @@ def import_technicians_from_df(df):
             exp_years = 0
             if exp_str:
                 try:
-                    exp_years = int(float(exp_str))
+                    exp_years = max(0, int(float(exp_str)))  # FIXED: Ensure non-negative
                 except (ValueError, TypeError):
                     logger.warning(f"Could not parse experience '{exp_str}' for {tech_name}")
 
@@ -1164,45 +1230,82 @@ def import_technicians_from_df(df):
             imported_count += 1
             logger.info(f"Added technician: {technician.name}")
             
-            if imported_count % 10 == 0:
-                db.session.commit()
-                logger.info(f"Committed {imported_count} technicians")
+            # FIXED: Commit more frequently and handle errors
+            if imported_count % 5 == 0:
+                try:
+                    db.session.commit()
+                    logger.info(f"Committed {imported_count} technicians")
+                except Exception as e:
+                    logger.error(f"Error committing batch: {e}")
+                    db.session.rollback()
+                    raise
                 
         except Exception as e:
             logger.error(f"Failed to import technician from row {index+1}: {e}")
             db.session.rollback()
 
-    db.session.commit()
-    logger.info(f"Finished import. Total: {imported_count}")
+    # Final commit
+    try:
+        db.session.commit()
+        logger.info(f"Finished import. Total: {imported_count}")
+    except Exception as e:
+        logger.error(f"Error in final commit: {e}")
+        db.session.rollback()
+    
     return imported_count
 
 def create_admin_user():
     """Create admin user if it doesn't exist."""
-    with app.app_context():
-        if not User.query.filter_by(username='admin').first():
-            admin = User(
-                username='admin',
-                email='admin@fieldservicesnationwide.com',
-                role='admin',
-                company_name='Field Services Nationwide'
-            )
-            admin.set_password('admin123')
-            db.session.add(admin)
-            db.session.commit()
-            logger.info("Created admin user: username='admin', password='admin123'")
+    try:
+        with app.app_context():
+            if not User.query.filter_by(username='admin').first():
+                admin = User(
+                    username='admin',
+                    email='admin@fieldservicesnationwide.com',
+                    role='admin',
+                    company_name='Field Services Nationwide'
+                )
+                admin.set_password('admin123')
+                db.session.add(admin)
+                db.session.commit()
+                logger.info("Created admin user: username='admin', password='admin123'")
+    except Exception as e:
+        logger.error(f"Error creating admin user: {e}")
 
 @app.route('/health')
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': datetime.utcnow().isoformat(),
+        'twilio_configured': twilio_client is not None,
+        'openai_configured': openai_client is not None
     })
+
+# FIXED: Better error handling for app context
+@app.errorhandler(404)
+def not_found_error(error):
+    return render_template('errors/404.html'), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return render_template('errors/500.html'), 500
 
 # ==================== MAIN EXECUTION ====================
 
 if __name__ == '__main__':
-    with app.app_context():
-        create_admin_user()
-    
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        with app.app_context():
+            # FIXED: Create tables if they don't exist
+            db.create_all()
+            create_admin_user()
+        
+        port = int(os.environ.get('PORT', 5000))
+        debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+        
+        logger.info(f"Starting Flask app on port {port}, debug={debug_mode}")
+        app.run(host='0.0.0.0', port=port, debug=debug_mode)
+        
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        raise
