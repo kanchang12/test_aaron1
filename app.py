@@ -1,171 +1,128 @@
-#!/usr/bin/env python3
 import os
-import logging
-from flask import Flask, request, jsonify, render_template
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from flask import Flask, render_template, request, jsonify
+from tavily import TavilyClient
 from openai import OpenAI
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Load environment variables from .env file
+load_dotenv()
 
+# Initialize Flask app
 app = Flask(__name__)
 
-# Configuration
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
-TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+# Get API keys from environment variables
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ElevenLabs voice - EXACT voice you want, natural settings
-VOICE_CONFIG = "g6xIsTj2HwM6VR4iXFCw-turbo_v2_5-0.9_0.7_0.9"  # Natural speed, stable, similar
-
-# Initialize clients
+# --- Initialize clients ---
 try:
-    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    logger.info("✅ Twilio initialized")
-except:
-    twilio_client = None
-    logger.error("❌ Twilio failed")
-
-try:
+    tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("✅ OpenAI initialized")
-except:
-    openai_client = None
-    logger.error("❌ OpenAI failed")
+except Exception as e:
+    print(f"Error initializing API clients: {e}")
+    # Handle this more gracefully in a production app, e.g., redirect to an error page
+    exit(1) # Exit if APIs can't be initialized
 
-# Store conversation state
-conversations = {}
+# Define the two real live sites for demonstration
+REAL_SITE_1_NAME = "Rightmove"
+REAL_SITE_1_DOMAIN = "rightmove.co.uk" # Used to target Tavily searches
+REAL_SITE_2_NAME = "SDL Property Auctions"
+REAL_SITE_2_DOMAIN = "sdlauctions.co.uk" # Used to target Tavily searches
 
-def generate_ai_response(user_input, call_sid):
-    # Pre-built fast responses - no API delay!
-    responses = {
-        'interested': "Great! How many years experience do you have?",
-        'yes': "Awesome! What's your networking background?", 
-        'experience': "Perfect! Are you available to start soon?",
-        'available': "Excellent! What's your email address?",
-        'email': "Thanks! Recruiter calls you tomorrow morning!",
-        'default': "Tell me about your experience?"
-    }
-    
-    user_lower = user_input.lower()
-    
-    if any(word in user_lower for word in ['interested', 'yes', 'sure', 'tell me']):
-        return responses['interested']
-    elif any(word in user_lower for word in ['year', 'experience', 'network', 'tech']):
-        return responses['available']
-    elif any(word in user_lower for word in ['available', 'start', 'soon', 'ready']):
-        return responses['email']
-    elif '@' in user_lower or 'email' in user_lower:
-        return responses['email']
-    else:
-        return responses['default']
-
-@app.route('/')
+@app.route("/", methods=["GET", "POST"])
 def index():
-    return render_template('index.html')
+    if request.method == "POST":
+        user_query = request.form["query"]
+        if not user_query:
+            return render_template("index.html", error="Please enter a query.")
 
-@app.route('/make_call', methods=['POST'])
-def make_call():
-    try:
-        data = request.get_json()
-        phone_number = data.get('phone_number')
-        
-        if not phone_number:
-            return jsonify({'error': 'Phone number required'}), 400
-            
-        if not twilio_client:
-            return jsonify({'error': 'Twilio not configured'}), 500
-        
-        call = twilio_client.calls.create(
-            url=request.url_root + 'voice_webhook',
-            to=phone_number,
-            from_=TWILIO_PHONE_NUMBER,
-            timeout=30
-        )
-        
-        logger.info(f"Call initiated to {phone_number}, SID: {call.sid}")
-        
-        return jsonify({
-            'success': True,
-            'call_sid': call.sid,
-            'message': f'Call initiated to {phone_number}'
-        })
-        
-    except Exception as e:
-        logger.error(f"Call failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        search_results = []
+        ai_response = ""
+        error_message = None
 
-@app.route('/voice_webhook', methods=['GET', 'POST'])
-def voice_webhook():
-    call_sid = request.values.get('CallSid')
-    logger.info(f"Voice webhook for {call_sid}")
-    
-    response = VoiceResponse()
-    
-    welcome = "Hi! This is Sarah from Field Services. I have a network technician job in Chicago paying seventy five dollars per hour. Are you interested?"
-    
-    # Use JUST your voice ID - let ElevenLabs use default natural settings
-    response.say(welcome, ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
-    
-    # Minimal timeout for instant response
-    gather = response.gather(
-        input='speech',
-        timeout=4,
-        speech_timeout=2,
-        action='/handle_speech?call_sid=' + call_sid,
-        method='POST'
-    )
-    
-    response.say("I'll call back later!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
-    response.hangup()
-    
-    return str(response)
+        try:
+            # Step 1: Use Tavily to search for property information on the real sites
 
-@app.route('/handle_speech', methods=['POST'])
-def handle_speech():
-    call_sid = request.args.get('call_sid')
-    speech_result = request.values.get('SpeechResult', '').strip()
-    
-    logger.info(f"Speech from {call_sid}: '{speech_result}'")
-    
-    response = VoiceResponse()
-    
-    # INSTANT response - no delays!
-    ai_response = generate_ai_response(speech_result, call_sid)
-    
-    # Use your exact voice ID with no modifications
-    response.say(ai_response, ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
-    
-    user_lower = speech_result.lower()
-    
-    # Only end if explicitly not interested
-    if any(phrase in user_lower for phrase in ['not interested', 'no thanks', 'stop', 'remove', 'busy']):
-        response.say("No problem! Have a great day!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
-        response.hangup()
-    else:
-        # Continue with minimal timeout
-        gather = response.gather(
-            input='speech',
-            timeout=4,
-            speech_timeout=2,
-            action='/handle_speech?call_sid=' + call_sid,
-            method='POST'
-        )
-        response.say("Thanks for your time!", ttsProvider="ElevenLabs", voice="g6xIsTj2HwM6VR4iXFCw")
-        response.hangup()
-    
-    return str(response)
+            # Search Rightmove
+            # Formulate the query to encourage Tavily to search within Rightmove's domain
+            tavily_query_rightmove = f"{user_query} site:{REAL_SITE_1_DOMAIN}"
+            print(f"Tavily Query ({REAL_SITE_1_NAME}): {tavily_query_rightmove}")
+            response_rightmove = tavily_client.search(query=tavily_query_rightmove, search_depth="basic", max_results=3)
 
-@app.route('/health')
-def health():
-    return jsonify({
-        'status': 'healthy',
-        'twilio_configured': twilio_client is not None,
-        'openai_configured': openai_client is not None
-    })
+            if response_rightmove and response_rightmove.get('results'):
+                for result in response_rightmove['results']:
+                    search_results.append({
+                        "source": REAL_SITE_1_NAME,
+                        "title": result.get('title', 'No Title'),
+                        "url": result.get('url', '#'),
+                        "content": result.get('content', 'No content available.')
+                    })
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+            # Search SDL Property Auctions
+            # Formulate the query to encourage Tavily to search within SDL's domain
+            tavily_query_sdl = f"{user_query} site:{REAL_SITE_2_DOMAIN}"
+            print(f"Tavily Query ({REAL_SITE_2_NAME}): {tavily_query_sdl}")
+            response_sdl = tavily_client.search(query=tavily_query_sdl, search_depth="basic", max_results=3)
+
+            if response_sdl and response_sdl.get('results'):
+                for result in response_sdl['results']:
+                    search_results.append({
+                        "source": REAL_SITE_2_NAME,
+                        "title": result.get('title', 'No Title'),
+                        "url": result.get('url', '#'),
+                        "content": result.get('content', 'No content available.')
+                    })
+
+            if not search_results:
+                ai_response = f"No highly relevant property information found from {REAL_SITE_1_NAME} or {REAL_SITE_2_NAME} for your query."
+            else:
+                # Step 2: Use OpenAI to summarize and provide insights
+                # Create a prompt for OpenAI based on the search results
+                context_for_openai = "Here are some search results from various UK property sites:\n\n"
+                for i, result in enumerate(search_results):
+                    context_for_openai += f"--- Result {i+1} from {result['source']} ---\n"
+                    context_for_openai += f"Title: {result['title']}\n"
+                    context_for_openai += f"URL: {result['url']}\n"
+                    context_for_openai += f"Content: {result['content'][:800]}...\n\n" # Truncate content for brevity
+
+                openai_prompt = f"Based on the following UK property information, answer the user's query: '{user_query}'. " \
+                                f"Focus on identifying potential property opportunities for investors in the UK. " \
+                                f"Summarize findings and highlight key details like property types, price indications, locations, and potential uses (e.g., HMO, development, auction opportunity). " \
+                                f"If no direct listings are found but relevant articles are, mention that. Prioritize concrete property details if available.\n\n" \
+                                f"{context_for_openai}\n\n" \
+                                f"Please provide a concise and helpful response for an investor, strictly based on the provided search results. If the search results are not enough to answer, state that."
+
+                print(f"\nOpenAI Prompt (truncated for display):\n{openai_prompt[:1500]}...") # Print truncated prompt
+
+                chat_completion = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo", # You can use a more advanced model like "gpt-4o" if available/preferred
+                    messages=[
+                        {"role": "system", "content": "You are a helpful AI assistant specializing in UK property investment. Provide concise and relevant insights based on the provided search data."},
+                        {"role": "user", "content": openai_prompt}
+                    ],
+                    max_tokens=600 # Adjust as needed
+                )
+                ai_response = chat_completion.choices[0].message.content
+
+        except Exception as e:
+            error_message = f"An error occurred: {e}. Please check your API keys, network connection, or try a different query."
+            print(f"Error: {e}")
+
+        return render_template("index.html",
+                               query=user_query,
+                               ai_response=ai_response,
+                               search_results=search_results,
+                               error=error_message,
+                               site1_name=REAL_SITE_1_NAME,
+                               site2_name=REAL_SITE_2_NAME)
+
+    return render_template("index.html",
+                           query="",
+                           ai_response="",
+                           search_results=[],
+                           error=None,
+                           site1_name=REAL_SITE_1_NAME,
+                           site2_name=REAL_SITE_2_NAME)
+
+if __name__ == "__main__":
+    app.run(debug=True)
