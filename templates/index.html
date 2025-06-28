@@ -1,79 +1,173 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>AI Call Tester</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Property Agent Demo (Real Sites)</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #eef2f6;
+            color: #333;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 960px;
+            margin: 20px auto;
+            background-color: #ffffff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.2em;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 10px;
+            font-size: 1.6em;
+        }
+        form {
+            display: flex;
+            margin-bottom: 25px;
+            gap: 10px;
+        }
+        input[type="text"] {
+            flex-grow: 1;
+            padding: 12px 15px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            font-size: 1.1em;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: #007bff;
+        }
+        button {
+            padding: 12px 25px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+        }
+        button:hover {
+            background-color: #0056b3;
+            transform: translateY(-1px);
+        }
+        .response-section {
+            margin-top: 25px;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e0e6eb;
+        }
+        .response-section p {
+            margin: 0;
+        }
+        .error-message {
+            color: #dc3545;
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .search-results-list {
+            list-style: none;
+            padding: 0;
+            margin-top: 20px;
+        }
+        .search-results-list li {
+            background-color: #ffffff;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            padding: 15px 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .search-results-list li h3 {
+            margin-top: 0;
+            color: #007bff;
+            font-size: 1.3em;
+        }
+        .search-results-list li p {
+            margin-bottom: 5px;
+        }
+        .search-results-list li a {
+            color: #007bff;
+            text-decoration: none;
+        }
+        .search-results-list li a:hover {
+            text-decoration: underline;
+        }
+        .source-tag {
+            display: inline-block;
+            background-color: #6c757d;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            margin-bottom: 10px;
+        }
+        .powered-by {
+            text-align: center;
+            margin-top: 40px;
+            font-size: 0.9em;
+            color: #6c757d;
+        }
+    </style>
 </head>
-<body class="bg-gray-100 min-h-screen flex items-center justify-center">
-    <div class="bg-white rounded-lg shadow-lg p-8 w-full max-w-md">
-        <h1 class="text-3xl font-bold text-center mb-6">AI Call Tester</h1>
-        
-        <div class="mb-6">
-            <label class="block text-sm font-medium mb-2">Phone Number:</label>
-            <input type="tel" id="phoneNumber" placeholder="+1234567890" 
-                   class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
-        </div>
-        
-        <button onclick="makeCall()" id="callBtn"
-                class="w-full bg-blue-600 text-white py-3 px-4 rounded-lg hover:bg-blue-700 font-semibold text-lg">
-            📞 Make Call
-        </button>
-        
-        <div id="status" class="mt-4 p-4 rounded-lg hidden"></div>
-        
-        <div class="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
-            <h3 class="font-semibold text-yellow-800 mb-2">How to test:</h3>
-            <ol class="text-sm text-yellow-700 space-y-1">
-                <li>1. Enter your phone number</li>
-                <li>2. Click "Make Call"</li>
-                <li>3. Answer when it rings</li>
-                <li>4. Talk to Sarah (AI)</li>
-            </ol>
+<body>
+    <div class="container">
+        <h1>AI Property Agent Demo</h1>
+
+        {% if error %}
+            <div class="error-message">{{ error }}</div>
+        {% endif %}
+
+        <p>Ask for property opportunities. The agent will search {{ site1_name }} and {{ site2_name }} (via Tavily web search) and provide an AI-driven summary.</p>
+        <p>Example: "Show me houses under £150k in Stockport suitable for HMOs yielding 10%+" or "Find commercial buildings in Greater Manchester under £300k with PD rights for flats."</p>
+
+        <form method="POST">
+            <input type="text" name="query" placeholder="Enter your property investment query..." value="{{ query }}" required>
+            <button type="submit">Search</button>
+        </form>
+
+        {% if ai_response %}
+            <h2>AI Agent's Insights</h2>
+            <div class="response-section">
+                <p>{{ ai_response }}</p>
+            </div>
+        {% endif %}
+
+        {% if search_results %}
+            <h2>Raw Search Results from Tavily</h2>
+            <ul class="search-results-list">
+                {% for result in search_results %}
+                    <li>
+                        <span class="source-tag">Source: {{ result.source }}</span>
+                        <h3><a href="{{ result.url }}" target="_blank">{{ result.title }}</a></h3>
+                        <p>{{ result.content }}</p>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+
+        <div class="powered-by">
+            Powered by Tavily API (for web search) and OpenAI API (for AI analysis)
         </div>
     </div>
-
-    <script>
-    async function makeCall() {
-        const phoneNumber = document.getElementById('phoneNumber').value;
-        const btn = document.getElementById('callBtn');
-        const status = document.getElementById('status');
-        
-        if (!phoneNumber) {
-            alert('Please enter a phone number');
-            return;
-        }
-        
-        btn.disabled = true;
-        btn.textContent = '📞 Calling...';
-        
-        try {
-            const response = await fetch('/make_call', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({phone_number: phoneNumber})
-            });
-            
-            const result = await response.json();
-            
-            status.className = 'mt-4 p-4 rounded-lg';
-            if (result.success) {
-                status.className += ' bg-green-100 border border-green-300 text-green-800';
-                status.innerHTML = '✅ <strong>Call initiated!</strong><br>Answer your phone now.';
-            } else {
-                status.className += ' bg-red-100 border border-red-300 text-red-800';
-                status.innerHTML = '❌ <strong>Call failed:</strong><br>' + result.error;
-            }
-            status.classList.remove('hidden');
-            
-        } catch (error) {
-            status.className = 'mt-4 p-4 rounded-lg bg-red-100 border border-red-300 text-red-800';
-            status.innerHTML = '❌ <strong>Error:</strong><br>' + error.message;
-            status.classList.remove('hidden');
-        }
-        
-        btn.disabled = false;
-        btn.textContent = '📞 Make Call';
-    }
-    </script>
 </body>
 </html>
