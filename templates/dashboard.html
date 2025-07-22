@@ -405,6 +405,7 @@
                 <span class="webhook-indicator"></span>
                 <span>Webhooks Active</span>
             </div>
+            <button onclick="forceRefresh()" style="margin-left: 15px; padding: 8px 16px; background: #10b981; color: white; border: none; border-radius: 6px; cursor: pointer;">🔄 Refresh</button>
         </div>
     </div>
 
@@ -649,13 +650,28 @@
         });
 
         socket.on('dashboard_data_update', (data) => {
+            console.log('📊 Dashboard data update received:', data);
             updateDashboardStats(data);
+            if (data.recent_calls) {
+                updateRecentCallsList(data.recent_calls);
+            }
         });
 
         socket.on('new_call_analysis', (data) => {
             console.log('📞 New call analyzed:', data);
-            // Refresh data when new call comes in
-            loadRecentCalls();
+            console.log('🎉 New analysis received for call:', data.call_id, 'from source:', data.source);
+            
+            // Force immediate refresh
+            setTimeout(() => {
+                console.log('🔄 Force refreshing dashboard data...');
+                loadRecentCalls();
+                loadStats();
+            }, 200);
+            
+            if (data.analysis) {
+                updateKPIDisplay(data.analysis);
+            }
+        });dRecentCalls();
             loadStats();
             updateKPIDisplay(data.analysis);
             
@@ -723,26 +739,38 @@
         }
 
         function loadRecentCalls() {
+            console.log('📞 Loading recent calls...');
             fetch('/api/calls?limit=10')
-                .then(response => response.json())
+                .then(response => {
+                    console.log('📞 API response status:', response.status);
+                    return response.json();
+                })
                 .then(data => {
+                    console.log('📞 Received calls data:', data);
                     updateRecentCallsList(data.calls || []);
                 })
                 .catch(error => {
-                    console.error('Error loading recent calls:', error);
+                    console.error('❌ Error loading recent calls:', error);
                     document.getElementById('recent-calls-list').innerHTML = 
                         '<div class="no-data">Error loading calls</div>';
                 });
         }
 
         function loadStats() {
+            console.log('📊 Loading stats...');
             fetch('/api/stats')
-                .then(response => response.json())
+                .then(response => {
+                    console.log('📊 Stats response status:', response.status);
+                    return response.json();
+                })
                 .then(data => {
+                    console.log('📊 Received stats data:', data);
                     updateDashboardStats(data);
                     updateOutcomeChart(data);
                 })
-                .catch(error => console.error('Error loading stats:', error));
+                .catch(error => {
+                    console.error('❌ Error loading stats:', error);
+                });
         }
 
         function updateOutcomeChart(data) {
@@ -835,17 +863,30 @@
             return 'score-poor';
         }
 
-        // Auto-refresh data every 30 seconds
-        setInterval(() => {
+        function forceRefresh() {
+            console.log('🔄 Manual refresh triggered');
             loadRecentCalls();
             loadStats();
-        }, 30000);
+            socket.emit('get_dashboard_data');
+        }
 
-        // Initial load
+        // Auto-refresh data every 10 seconds (more frequent for testing)
+        setInterval(() => {
+            console.log('🔄 Auto-refreshing dashboard data...');
+            loadRecentCalls();
+            loadStats();
+        }, 10000);
+
+        // Initial load - try multiple times to ensure connection
         setTimeout(() => {
             loadRecentCalls();
             loadStats();
-        }, 1000);
+        }, 500);
+        
+        setTimeout(() => {
+            loadRecentCalls();
+            loadStats();
+        }, 2000);
     </script>
 </body>
 </html>
