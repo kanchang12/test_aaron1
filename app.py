@@ -103,16 +103,20 @@ class ElevenLabsAgentStream:
         self.max_reconnect_attempts = 5
         print(f"ElevenLabsAgentStream initialized for Call SID: {self.call_sid}")
 
-    async def _connect(self):
-        ws_url = f"wss://api.elevenlabs.io/v1/conversational-ai-stream/{self.elevenlabs_agent_id}"
+async def _connect(self):
+        # Use the correct WebSocket endpoint that you found, which accepts the connection
+        ws_url = "wss://api.elevenlabs.io/v1/convai/conversation"
         headers = {
             "xi-api-key": self.elevenlabs_api_key,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json" # This header is good for the initial payload
         }
         try:
+            # Attempt to establish the WebSocket connection
             self.websocket = await websockets.connect(ws_url, extra_headers=headers)
             print(f"✅ ElevenLabs Agent WebSocket connected for {self.call_sid}")
 
+            # Send the initial configuration message, including the agent_id
+            # The agent_id is sent as a parameter in this JSON message, not in the URL path
             await self.websocket.send(json.dumps({
                 "api_key": self.elevenlabs_api_key,
                 "agent_id": self.elevenlabs_agent_id,
@@ -121,11 +125,12 @@ class ElevenLabsAgentStream:
                 "can_be_interrupted": True
             }))
             self.reconnect_attempts = 0
-            return True
+            return True # Indicate successful connection and initial setup
         except Exception as e:
+            # Handle connection failure
             print(f"❌ Failed to connect ElevenLabs Agent WebSocket for {self.call_sid}: {e}")
-            self.websocket = None
-            return False
+            self.websocket = None # Ensure websocket is None on failure
+            return False # Indicate connection failure
 
     async def _send_audio(self):
         while not self.stop_event.is_set():
