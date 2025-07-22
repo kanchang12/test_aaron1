@@ -358,7 +358,7 @@ class LiveCallMonitor:
         socketio.emit('call_started', {
             'call_sid': call_sid,
             'number': call_obj.from_formatted,
-            'to_number': call_obj.to_number, # Changed to_number for accuracy
+            'to_number': call_obj.to_formatted, # Changed to_number for accuracy
             'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
         })
 
