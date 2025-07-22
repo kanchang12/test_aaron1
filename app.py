@@ -87,7 +87,6 @@ live_data = {
 }
 
 # --- ElevenLabs Conversational AI Stream Manager ---
-# (This class remains largely the same, as its internal queues are per-instance)
 class ElevenLabsAgentStream:
     def __init__(self, call_sid, elevenlabs_api_key, elevenlabs_agent_id, socketio_ref):
         self.call_sid = call_sid
@@ -103,8 +102,7 @@ class ElevenLabsAgentStream:
         self.max_reconnect_attempts = 5
         print(f"ElevenLabsAgentStream initialized for Call SID: {self.call_sid}")
 
-async def _connect(self):
-        # Use the correct WebSocket endpoint that you found, which accepts the connection
+    async def _connect(self):
         ws_url = "wss://api.elevenlabs.io/v1/convai/conversation"
         headers = {
             "xi-api-key": self.elevenlabs_api_key,
@@ -136,7 +134,7 @@ async def _connect(self):
         while not self.stop_event.is_set():
             try:
                 audio_chunk = await self.audio_queue.get()
-                if audio_chunk is None: # Sentinel
+                if audio_chunk is None: # Sentinel to break loop gracefully
                     break
                 if self.websocket and self.websocket.open:
                     audio_payload = base64.b64encode(audio_chunk).decode('utf-8')
@@ -152,16 +150,17 @@ async def _connect(self):
                         print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
                         await asyncio.sleep(1)
                         if await self._connect():
-                             print(f"Reconnected for {self.call_sid}.")
+                            print(f"Reconnected for {self.call_sid}.")
                         else:
-                             print(f"Reconnect failed for {self.call_sid}. Re-queueing audio for next attempt.")
-                             await self.audio_queue.put(audio_chunk)
+                            print(f"Reconnect failed for {self.call_sid}. Re-queueing audio for next attempt.")
+                            # Re-queue the audio if reconnect fails to attempt sending it later
+                            await self.audio_queue.put(audio_chunk)
                     else:
                         print(f"Max reconnect attempts reached or stop event set for {self.call_sid}. Discarding audio.")
 
             except Exception as e:
                 print(f"❌ Error sending audio to ElevenLabs for {self.call_sid}: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1) # Small delay to prevent tight loop on error
 
     async def _receive_events(self):
         while not self.stop_event.is_set():
@@ -177,6 +176,7 @@ async def _connect(self):
                             call_data = live_data['active_calls'].get(self.call_sid)
                             if call_data:
                                 call_data['transcripts'].append(transcript_chunk)
+                                # Pass full transcript history for context
                                 analysis_result = analyze_agent_response(transcript_chunk, call_data['transcripts'])
                                 call_data['analysis'].append(analysis_result)
                                 live_data['call_stats']['analyzed_segments'] += 1
@@ -196,14 +196,16 @@ async def _connect(self):
                                     'timestamp': datetime.now().strftime("%H:%M:%S")
                                 })
                     elif event['type'] == 'agent_output':
+                        # Handle agent audio output here if needed, e.g., send to Twilio
                         pass
                     elif event['type'] == 'pong':
+                        # Handle pong messages to keep connection alive if necessary
                         pass
                     else:
                         print(f"ElevenLabs Agent Event ({self.call_sid}): {event['type']} - {event}")
 
                 else:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1) # Small delay if WebSocket is not yet connected
 
             except websockets.exceptions.ConnectionClosedOK:
                 print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed gracefully.")
@@ -214,7 +216,7 @@ async def _connect(self):
                     if await self._connect():
                         print(f"Reconnected for {self.call_sid}.")
                 else:
-                    self.stop_event.set()
+                    self.stop_event.set() # Stop if max reconnects reached or explicitly stopped
             except Exception as e:
                 print(f"❌ Error receiving from ElevenLabs for {self.call_sid}: {e}")
                 if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
@@ -224,8 +226,8 @@ async def _connect(self):
                     if await self._connect():
                         print(f"Reconnected for {self.call_sid}.")
                 else:
-                    self.stop_event.set()
-                await asyncio.sleep(0.1)
+                    self.stop_event.set() # Stop if max reconnects reached or explicitly stopped
+                await asyncio.sleep(0.1) # Small delay to prevent tight loop on error
 
     async def _run(self):
         connected = await self._connect()
@@ -233,18 +235,21 @@ async def _connect(self):
             print(f"Could not establish initial connection for {self.call_sid}. Stopping stream.")
             return
 
+        # Run send and receive tasks concurrently
         await asyncio.gather(
             self._send_audio(),
             self._receive_events(),
-            return_exceptions=False
+            return_exceptions=False # Allows handling exceptions within each coroutine
         )
         print(f"ElevenLabs Agent Stream finished for {self.call_sid}")
 
     def start(self):
+        # Start the asyncio event loop in a new thread
         self.thread = threading.Thread(target=self._run_async_in_thread, daemon=True)
         self.thread.start()
 
     def _run_async_in_thread(self):
+        # Each thread needs its own asyncio event loop
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self._run())
@@ -252,19 +257,22 @@ async def _connect(self):
         print(f"Async loop closed for ElevenLabsAgentStream for {self.call_sid}")
 
     async def _async_stop(self):
+        # Set stop event to signal coroutines to exit
         self.stop_event.set()
-        await self.audio_queue.put(None)
+        await self.audio_queue.put(None) # Put sentinel to unblock _send_audio
         if self.websocket and self.websocket.open:
-            await self.websocket.close()
+            await self.websocket.close() # Close the WebSocket connection
             print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed.")
 
     def stop(self):
+        # Schedule the async stop method to run in the stream's event loop
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._async_stop(), self.loop)
         else:
             print(f"ElevenLabsAgentStream for {self.call_sid} is not running, no explicit stop needed.")
 
     def send_audio(self, audio_chunk_pcm):
+        # Add audio chunk to the queue from a different thread (e.g., Flask request handler)
         if self.loop and self.loop.is_running() and not self.stop_event.is_set():
             try:
                 asyncio.run_coroutine_threadsafe(self.audio_queue.put(audio_chunk_pcm), self.loop)
@@ -363,7 +371,7 @@ class LiveCallMonitor:
         socketio.emit('call_started', {
             'call_sid': call_sid,
             'number': call_obj.from_formatted,
-            'to_number': call_obj.to_formatted, # Changed to_number for accuracy
+            'to_number': call_obj.to_formatted,
             'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
         })
 
@@ -545,11 +553,11 @@ def simulate_call():
                     live_data['call_stats']['analyzed_segments'] += 1
 
                     if analysis_result and analysis_result.get('overall_score') is not None:
-                         if live_data['call_stats']['analyzed_segments'] > 0:
+                        if live_data['call_stats']['analyzed_segments'] > 0:
                             current_total = live_data['call_stats']['average_quality_score'] * (live_data['call_stats']['analyzed_segments'] - 1)
                             live_data['call_stats']['average_quality_score'] = \
                                 (current_total + analysis_result['overall_score']) / live_data['call_stats']['analyzed_segments']
-                         else:
+                        else:
                             live_data['call_stats']['average_quality_score'] = analysis_result['overall_score']
 
 
