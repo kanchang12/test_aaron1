@@ -298,7 +298,7 @@ def update_daily_stats(date_str: str, analysis_result: Dict):
 # --- Flask Routes ---
 @app.route('/')
 def dashboard():
-    return render_template('call_analysis_dashboard.html')
+    return render_template('dashboard.html')
 
 @app.route('/health')
 def health_check():
