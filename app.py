@@ -98,7 +98,7 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
     """
     try:
         prompt = f"""
-        Analyze this call transcript and provide analysis as valid JSON only.
+        Analyze this call transcript carefully and provide accurate analysis based on what actually happened.
         
         Call Details:
         - Duration: {call_metadata.get('duration', 'unknown')} seconds
@@ -107,7 +107,31 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
         
         Transcript: "{transcript}"
 
-        Rate each KPI from 1-10 and determine call success. Respond with ONLY this JSON structure:
+        Instructions:
+        1. Read the ENTIRE transcript carefully
+        2. Identify the customer's main issue/complaint
+        3. Determine if the issue was actually resolved
+        4. Rate based on what ACTUALLY happened, not ideal scenarios
+        5. Consider the customer's emotional journey from start to finish
+
+        Rate each KPI from 1-10 based on actual performance:
+        - 1-3: Poor (major issues, customer upset, unresolved)
+        - 4-6: Average (adequate but room for improvement)
+        - 7-8: Good (effective, customer satisfied)
+        - 9-10: Excellent (exceptional service, delighted customer)
+
+        For call_outcome:
+        - "success": Issue fully resolved, customer satisfied
+        - "partial_success": Some progress but not fully resolved
+        - "failure": Issue not resolved, customer still upset
+
+        For interaction_sentiment:
+        - "positive": Customer ended happy/satisfied
+        - "negative": Customer ended frustrated/angry
+        - "neutral": Customer neutral throughout
+        - "mixed": Customer started negative but ended positive (or vice versa)
+
+        Respond with ONLY this JSON structure:
 
         {{
             "call_success_rate": 8,
@@ -321,8 +345,23 @@ def debug_calls():
     return jsonify({
         'completed_calls': call_data_store['completed_calls'],
         'overall_stats': call_data_store['overall_stats'],
-        'total_stored': len(call_data_store['completed_calls'])
+        'total_stored': len(call_data_store['completed_calls']),
+        'call_ids': list(call_data_store['completed_calls'].keys())
     })
+
+@app.route('/debug/latest')
+def debug_latest():
+    """Debug endpoint to see latest call details"""
+    calls = list(call_data_store['completed_calls'].values())
+    if calls:
+        latest = sorted(calls, key=lambda x: x['timestamp'], reverse=True)[0]
+        return jsonify({
+            'latest_call': latest,
+            'analysis_keys': list(latest.get('analysis', {}).keys()),
+            'has_transcript': bool(latest.get('transcript')),
+            'transcript_length': len(latest.get('transcript', ''))
+        })
+    return jsonify({'message': 'No calls found'})
 
 @app.route('/health')
 def health_check():
@@ -448,6 +487,7 @@ def xelion_audio_webhook():
             provided_transcript = request.form.get('transcript', '')
             
             print(f"📞 Processing multipart form data for call: {call_id}")
+            print(f"📞 Agent: {agent_id}, Duration: {duration}s")
             
             # Handle audio file if present
             unique_filename = None
@@ -463,7 +503,7 @@ def xelion_audio_webhook():
                     print(f"📞 Audio file saved: {unique_filename}")
                 else:
                     print(f"❌ Invalid audio file: {file.filename}")
-            
+
             # Determine transcript source
             transcript = provided_transcript
             transcript_source = "provided"
@@ -475,13 +515,14 @@ def xelion_audio_webhook():
                 transcript_source = "whisper_transcribed"
                 
                 if not transcript:
+                    print(f"❌ Transcription failed for {unique_filename}")
                     return jsonify({
                         'status': 'error',
                         'call_id': call_id,
                         'audio_file': unique_filename,
                         'error': 'Audio transcription failed'
                     }), 400
-            
+
             # Process transcript if available
             analysis_result = None
             if transcript and transcript.strip():
@@ -495,59 +536,78 @@ def xelion_audio_webhook():
                 }
                 
                 print(f"📞 Analyzing transcript for call: {call_id} (source: {transcript_source})")
+                print(f"📞 Transcript preview: {transcript[:200]}...")
+                
                 analysis_result = analyze_call_transcript(transcript, call_metadata)
                 
-                # Store call data
-                call_record = {
-                    'call_id': call_id,
-                    'transcript': transcript,
-                    'analysis': analysis_result,
-                    'metadata': call_metadata,
-                    'timestamp': datetime.now().isoformat(),
-                    'duration': duration,
-                    'source': 'xelion',
-                    'audio_file': unique_filename,
-                    'transcript_source': transcript_source
-                }
+                if analysis_result:
+                    print(f"📊 Analysis completed - Outcome: {analysis_result.get('call_outcome')}, Score: {analysis_result.get('overall_score')}")
+                    
+                    # Store call data
+                    call_record = {
+                        'call_id': call_id,
+                        'transcript': transcript,
+                        'analysis': analysis_result,
+                        'metadata': call_metadata,
+                        'timestamp': datetime.now().isoformat(),
+                        'duration': duration,
+                        'source': 'xelion',
+                        'audio_file': unique_filename,
+                        'transcript_source': transcript_source
+                    }
                 
                 call_data_store['completed_calls'][call_id] = call_record
+                print(f"📊 Call record stored successfully")
+                
                 update_overall_stats(analysis_result, duration)
+                print(f"📊 Overall stats updated")
+                
                 update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
+                print(f"📊 Daily stats updated")
                 
                 print(f"📊 Stored Xelion call. Total calls now: {len(call_data_store['completed_calls'])}")
                 
                 # Emit BOTH events to ensure dashboard updates
-                socketio.emit('new_call_analysis', {
-                    'call_id': call_id,
-                    'analysis': analysis_result,
-                    'duration': duration,
-                    'agent_id': agent_id,
-                    'timestamp': datetime.now().strftime("%H:%M:%S"),
-                    'has_audio': unique_filename is not None,
-                    'transcript_source': transcript_source,
-                    'source': 'xelion'
-                })
-                
-                # Get fresh data for dashboard
-                recent_calls = list(call_data_store['completed_calls'].values())[-10:]
-                recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
-                stats = call_data_store['overall_stats']
-                
-                socketio.emit('dashboard_data_update', {
-                    'recent_calls': recent_calls,
-                    'total_calls': stats['total_calls'],
-                    'successful_calls': stats['successful_calls'],
-                    'failed_calls': stats['failed_calls'],
-                    'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
-                    'positive_interactions': stats['positive_interactions'],
-                    'negative_interactions': stats['negative_interactions'],
-                    'neutral_interactions': stats['neutral_interactions'],
-                    'average_call_duration': round(stats['average_call_duration'], 1),
-                    'kpi_averages': stats['kpi_averages']
-                })
+                try:
+                    print(f"📡 Emitting new_call_analysis event...")
+                    socketio.emit('new_call_analysis', {
+                        'call_id': call_id,
+                        'analysis': analysis_result,
+                        'duration': duration,
+                        'agent_id': agent_id,
+                        'timestamp': datetime.now().strftime("%H:%M:%S"),
+                        'has_audio': unique_filename is not None,
+                        'transcript_source': transcript_source,
+                        'source': 'xelion'
+                    })
+                    print(f"📡 new_call_analysis event emitted successfully")
+                    
+                    # Get fresh data for dashboard
+                    recent_calls = list(call_data_store['completed_calls'].values())[-10:]
+                    recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+                    stats = call_data_store['overall_stats']
+                    
+                    print(f"📡 Emitting dashboard_data_update event...")
+                    socketio.emit('dashboard_data_update', {
+                        'recent_calls': recent_calls,
+                        'total_calls': stats['total_calls'],
+                        'successful_calls': stats['successful_calls'],
+                        'failed_calls': stats['failed_calls'],
+                        'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+                        'positive_interactions': stats['positive_interactions'],
+                        'negative_interactions': stats['negative_interactions'],
+                        'neutral_interactions': stats['neutral_interactions'],
+                        'average_call_duration': round(stats['average_call_duration'], 1),
+                        'kpi_averages': stats['kpi_averages']
+                    })
+                    print(f"📡 dashboard_data_update event emitted successfully")
+                    
+                except Exception as socket_error:
+                    print(f"❌ WebSocket emission error: {socket_error}")
+                    # Continue even if WebSocket fails
                 
                 print(f"✅ Successfully analyzed Xelion call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
-                print(f"📡 Emitted WebSocket updates to dashboard")
+                print(f"📡 Preparing response...")
             else:
                 print(f"📞 No transcript available for call: {call_id}")
             
