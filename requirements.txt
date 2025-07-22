@@ -4,7 +4,7 @@ python-dotenv
 twilio
 openai
 elevenlabs
-websockets>=12.0 # Ensure this is up to date
-aiohttp>=3.9    # Add this or ensure it's up to date
+websockets # Ensure this is up to date
+aiohttp    # Add this or ensure it's up to date
 audioop
 redis
