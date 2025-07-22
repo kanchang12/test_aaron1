@@ -27,7 +27,7 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 
 # SPECIFY YOUR PHONE NUMBERS TO MONITOR
 MONITOR_PHONE_NUMBERS = [
-    '+447488891052',  # Your Twilio phone number 1
+    '+1234567890',  # Your Twilio phone number 1
     '+0987654321',  # Your Twilio phone number 2
     # Add more numbers as needed
 ]
@@ -477,6 +477,122 @@ def simulate_call():
         
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/webhook/call-start', methods=['POST'])
+def twilio_call_start():
+    """Twilio webhook when call starts"""
+    from twilio.twiml import VoiceResponse
+    
+    call_sid = request.form.get('CallSid')
+    from_number = request.form.get('From')
+    to_number = request.form.get('To')
+    
+    print(f"🔔 Twilio webhook: Call {call_sid} from {from_number} to {to_number}")
+    
+    # Create call record
+    live_data['total_calls'] += 1
+    live_data['active_calls'][call_sid] = {
+        'sid': call_sid,
+        'from': from_number,
+        'to': to_number,
+        'start_time': datetime.datetime.now(),
+        'status': 'in-progress',
+        'transcript': '',
+        'analysis': {},
+        'duration': 0
+    }
+    
+    # Create TwiML response with media streaming
+    response = VoiceResponse()
+    
+    # Start media streaming
+    response.start().stream(
+        url=f'wss://{request.host}/audio-stream/{call_sid}',
+        track='both_tracks'
+    )
+    
+    # Connect the call
+    response.dial(to_number)
+    
+    # Emit to dashboard
+    socketio.emit('call_started', {
+        'call_sid': call_sid,
+        'from': from_number,
+        'to': to_number,
+        'timestamp': datetime.datetime.now().isoformat()
+    })
+    
+    return str(response)
+
+@app.route('/webhook/call-end', methods=['POST'])
+def twilio_call_end():
+    """Twilio webhook when call ends"""
+    call_sid = request.form.get('CallSid')
+    duration = int(request.form.get('CallDuration', 0))
+    
+    print(f"🔚 Call ended: {call_sid}, duration: {duration}s")
+    
+    if call_sid in live_data['active_calls']:
+        monitor.handle_call_end(call_sid)
+    
+    return '', 200
+
+@socketio.on('connect', namespace='/audio-stream')
+def handle_audio_connect():
+    print(f"🎧 Audio stream connected")
+
+@socketio.on('media', namespace='/audio-stream')
+def handle_media_stream(data):
+    """Handle incoming audio stream from Twilio"""
+    try:
+        call_sid = data.get('streamSid', '').replace('MZ', '').replace('ST', '')
+        
+        if 'media' in data and 'payload' in data['media']:
+            # Get audio data
+            audio_payload = data['media']['payload']
+            
+            # Decode base64 audio (mulaw format from Twilio)
+            import audioop
+            audio_data = base64.b64decode(audio_payload)
+            
+            # Convert mulaw to linear PCM
+            linear_audio = audioop.ulaw2lin(audio_data, 2)
+            
+            # Process audio chunk for transcription
+            transcript_chunk = process_audio_for_transcription(linear_audio)
+            
+            if transcript_chunk and call_sid in live_data['active_calls']:
+                monitor.process_transcript(call_sid, transcript_chunk)
+                
+    except Exception as e:
+        print(f"❌ Audio processing error: {e}")
+
+def process_audio_for_transcription(audio_data):
+    """Convert audio to transcript using Whisper API"""
+    try:
+        # Create temporary wav file
+        import tempfile
+        import wave
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            with wave.open(temp_file.name, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(8000)  # 8kHz (Twilio default)
+                wav_file.writeframes(audio_data)
+            
+            # Send to OpenAI Whisper
+            with open(temp_file.name, 'rb') as audio_file:
+                transcript = openai.Audio.transcribe(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="en"
+                )
+                return transcript.text
+                
+    except Exception as e:
+        print(f"❌ Whisper transcription error: {e}")
+        return None
 
 @app.route('/start-monitoring', methods=['POST'])
 def start_monitoring():
