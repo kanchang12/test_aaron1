@@ -97,13 +97,24 @@ class ElevenLabsAgentStream:
         self.audio_queue = asyncio.Queue()
         self.stop_event = asyncio.Event()
         self.thread = None
-        self.loop = None
+        self.loop = None # Initialize loop as None
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         print(f"ElevenLabsAgentStream initialized for Call SID: {self.call_sid}")
+        # --- DEBUG PRINT (Crucial for verifying agent_id value) ---
+        print(f"DEBUG: ElevenLabsAgentStream for {self.call_sid} initialized with agent_id: '{self.elevenlabs_agent_id}'")
+        # --- END DEBUG PRINT ---
 
     async def _connect(self):
-        ws_url = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={self.elevenlabs_agent_id}"
+        # --- MODIFIED: Include agent_id in the URL query parameters ---
+        if not self.elevenlabs_agent_id:
+            print("❌ ELEVENLABS_AGENT_ID is missing or empty. Cannot connect to ElevenLabs Conversational AI.")
+            # Do not raise ValueError here, just return False and let _run handle it
+            return False
+
+        base_ws_url = "wss://api.elevenlabs.io/v1/convai/conversation"
+        ws_url = f"{base_ws_url}?agent_id={self.elevenlabs_agent_id}"
+
         headers = {
             "xi-api-key": self.elevenlabs_api_key,
             "Content-Type": "application/json" # This header is good for the initial payload
@@ -111,13 +122,12 @@ class ElevenLabsAgentStream:
         try:
             # Attempt to establish the WebSocket connection
             self.websocket = await websockets.connect(ws_url, extra_headers=headers)
-            print(f"✅ ElevenLabs Agent WebSocket connected for {self.call_sid}")
+            print(f"✅ ElevenLabs Agent WebSocket connected for {self.call_sid} to URL: {ws_url}")
 
-            # Send the initial configuration message, including the agent_id
-            # The agent_id is sent as a parameter in this JSON message, not in the URL path
+            # Send the initial configuration message
+            # REMOVED agent_id from this JSON as it's now in the URL
             await self.websocket.send(json.dumps({
                 "api_key": self.elevenlabs_api_key,
-                "agent_id": self.elevenlabs_agent_id,
                 "text_input_mode": "raw",
                 "sample_rate": 8000,
                 "can_be_interrupted": True
@@ -230,9 +240,12 @@ class ElevenLabsAgentStream:
                 await asyncio.sleep(0.1) # Small delay to prevent tight loop on error
 
     async def _run(self):
+        # This is where the core async logic runs.
+        # It should only be run once per stream instance.
         connected = await self._connect()
         if not connected:
             print(f"Could not establish initial connection for {self.call_sid}. Stopping stream.")
+            self.stop_event.set() # Ensure stop event is set if initial connect fails
             return
 
         # Run send and receive tasks concurrently
@@ -244,17 +257,49 @@ class ElevenLabsAgentStream:
         print(f"ElevenLabs Agent Stream finished for {self.call_sid}")
 
     def start(self):
-        # Start the asyncio event loop in a new thread
-        self.thread = threading.Thread(target=self._run_async_in_thread, daemon=True)
-        self.thread.start()
+        # If a thread already exists and is alive, do not start a new one.
+        if self.thread is None or not self.thread.is_alive():
+            self.stop_event.clear() # Clear stop event for a new start
+            self.thread = threading.Thread(target=self._run_async_in_thread, daemon=True)
+            self.thread.start()
+            print(f"Started ElevenLabsAgentStream thread for {self.call_sid}")
+        else:
+            print(f"ElevenLabsAgentStream thread for {self.call_sid} already running or not properly shut down. Skipping start.")
+
 
     def _run_async_in_thread(self):
         # Each thread needs its own asyncio event loop
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._run())
-        self.loop.close()
-        print(f"Async loop closed for ElevenLabsAgentStream for {self.call_sid}")
+        # Ensure a new event loop is created ONLY if one isn't already set for this thread
+        try:
+            # Attempt to get the current event loop. If none, a new one needs to be created.
+            self.loop = asyncio.get_event_loop()
+            print(f"Re-using existing event loop for {self.call_sid} in thread {threading.current_thread().name}")
+        except RuntimeError:
+            # No current event loop, create a new one
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            print(f"Created new event loop for {self.call_sid} in thread {threading.current_thread().name}")
+
+        try:
+            self.loop.run_until_complete(self._run())
+        except Exception as e:
+            print(f"❌ Error in ElevenLabsAgentStream thread for {self.call_sid}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Ensure proper cleanup
+            if self.loop and not self.loop.is_closed():
+                # Cancel all remaining tasks in the loop before closing
+                for task in asyncio.all_tasks(self.loop):
+                    task.cancel()
+                # Run the loop briefly to allow tasks to finish canceling
+                try:
+                    self.loop.run_until_complete(asyncio.sleep(0.1))
+                except asyncio.CancelledError:
+                    pass # Expected if tasks were cancelled
+                self.loop.close()
+                print(f"Async loop closed for ElevenLabsAgentStream for {self.call_sid}")
+            self.loop = None # Dereference the loop
 
     async def _async_stop(self):
         # Set stop event to signal coroutines to exit
@@ -268,8 +313,14 @@ class ElevenLabsAgentStream:
         # Schedule the async stop method to run in the stream's event loop
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._async_stop(), self.loop)
+            # Give some time for the stop to propagate and the thread to finish
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=5) # Wait for thread to finish for up to 5 seconds
+                if self.thread.is_alive():
+                    print(f"Warning: ElevenLabsAgentStream thread for {self.call_sid} did not terminate gracefully.")
         else:
             print(f"ElevenLabsAgentStream for {self.call_sid} is not running, no explicit stop needed.")
+
 
     def send_audio(self, audio_chunk_pcm):
         # Add audio chunk to the queue from a different thread (e.g., Flask request handler)
@@ -343,6 +394,9 @@ class LiveCallMonitor:
     def handle_new_call(self, call_obj):
         call_sid = call_obj.sid
         if call_sid in live_data['active_calls']:
+            # This call is already being tracked, possibly from a duplicate webhook
+            # or rapid polling. Do not re-initialize the stream.
+            print(f"Call {call_sid} already active. Skipping re-initialization.")
             return
 
         print(f"🎉 New call detected: {call_sid} from {call_obj.from_formatted} to {call_obj.to_formatted}")
@@ -371,7 +425,7 @@ class LiveCallMonitor:
         socketio.emit('call_started', {
             'call_sid': call_sid,
             'number': call_obj.from_formatted,
-            'to_number': call_obj.to_formatted,
+            'to_number': call_obj.to_number,
             'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
         })
 
@@ -707,6 +761,7 @@ if __name__ == '__main__':
 
     call_monitor.start_polling()
 
+    # Using allow_unsafe_werkzeug for development. Remove or set to False in production.
     socketio.run(app, debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)), allow_unsafe_werkzeug=True)
 
 # Gunicorn entry point (used by Koyeb)
