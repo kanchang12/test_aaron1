@@ -14,16 +14,15 @@ from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
 from twilio.rest import Client
 import openai
-import audioop
+import audioop # This is a built-in module, no need to pip install
 import websockets
-import aiohttp # For async HTTP client in websockets
+import aiohttp # Used by websockets for async HTTP connections
 
 # Import the ElevenLabs Client
 from elevenlabs.client import ElevenLabs
 from elevenlabs import Voice, VoiceSettings, play
-REDIS_URL = 'redis://localhost:6379/0'
-app = Flask(__name__)
-# Load environment variables from .env file
+
+# Load environment variables from .env file (for local development)
 load_dotenv()
 
 # --- Configuration ---
@@ -31,7 +30,7 @@ TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 ELEVENLABS_API_KEY = os.environ.get('ELEVENLABS_API_KEY')
-ELEVENLABS_AGENT_ID = os.environ.get('ELEVENLABS_AGENT_ID') # Crucial for Conversational AI
+ELEVENLABS_AGENT_ID = os.environ.get('ELEVENLABS_AGENT_ID')
 
 MONITOR_PHONE_NUMBERS_STR = os.environ.get('MONITOR_PHONE_NUMBERS', '')
 MONITOR_PHONE_NUMBERS = [num.strip() for num in MONITOR_PHONE_NUMBERS_STR.split(',') if num.strip()]
@@ -39,10 +38,14 @@ MONITOR_PHONE_NUMBERS = [num.strip() for num in MONITOR_PHONE_NUMBERS_STR.split(
 ANALYSIS_INTERVAL_SECONDS = int(os.environ.get('ANALYSIS_INTERVAL_SECONDS', 10))
 CALL_POLLING_INTERVAL_SECONDS = int(os.environ.get('CALL_POLLING_INTERVAL_SECONDS', 15))
 
+# Secret key for Flask and Flask-SocketIO (essential for sessions and security)
+# !!! IMPORTANT: Replace 'your_super_secret_default_key_replace_me_in_prod' with a strong, random key in production !!!
+SECRET_KEY = os.environ.get('SECRET_KEY', 'your_super_secret_default_key_replace_me_in_prod')
+
 
 # --- Input Validation ---
-if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID]):
-    print("❌ Missing environment variables! Ensure TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID are set.")
+if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, SECRET_KEY]):
+    print("❌ Missing environment variables! Ensure TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, and SECRET_KEY are set.")
     exit(1)
 
 if not MONITOR_PHONE_NUMBERS:
@@ -53,22 +56,27 @@ if not MONITOR_PHONE_NUMBERS:
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 openai.api_key = OPENAI_API_KEY
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-app.config['REDIS_URL'] = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+
 
 # --- Flask App Setup ---
 app = Flask(__name__)
-# Use 'threading' async_mode for simplicity when integrating with a separate asyncio thread
-# For pure async (eventlet/gevent), you'd need to adapt the ElevenLabsAgentStream more carefully.
+
+# Configure Flask app with the SECRET_KEY
+app.config['SECRET_KEY'] = SECRET_KEY
+
+# Initialize Flask-SocketIO WITHOUT a message queue
+# This means it will ONLY work correctly with a single Gunicorn worker.
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
-    async_mode='threading', # Keep this as you're using threads
-    message_queue=REDIS_URL # <--- ADD THIS LINE
+    cors_allowed_origins="*", # Adjust for production security if needed
+    async_mode='threading' # Still good to specify, as you have threads
 )
 
-# --- Global Data Stores (In-memory for simplicity, consider Redis for production) ---
+# --- Global Data Stores (In-memory for simplicity) ---
+# Note: With multiple workers and no Redis, these in-memory stores would NOT be shared.
+# However, since we're forcing a single worker, this is okay.
 live_data = {
-    'active_calls': {},  # call_sid: { 'number': ..., 'start_time': ..., 'duration': ..., 'transcripts': [], 'analysis': [], 'elevenlabs_agent_stream': ElevenLabsAgentStreamInstance }
+    'active_calls': {},
     'call_stats': {
         'total_calls': 0,
         'in_progress': 0,
@@ -79,6 +87,7 @@ live_data = {
 }
 
 # --- ElevenLabs Conversational AI Stream Manager ---
+# (This class remains largely the same, as its internal queues are per-instance)
 class ElevenLabsAgentStream:
     def __init__(self, call_sid, elevenlabs_api_key, elevenlabs_agent_id, socketio_ref):
         self.call_sid = call_sid
@@ -104,15 +113,14 @@ class ElevenLabsAgentStream:
             self.websocket = await websockets.connect(ws_url, extra_headers=headers)
             print(f"✅ ElevenLabs Agent WebSocket connected for {self.call_sid}")
 
-            # Send initial configuration message
             await self.websocket.send(json.dumps({
-                "api_key": self.elevenlabs_api_key, # Redundant if in header, but good to be explicit
+                "api_key": self.elevenlabs_api_key,
                 "agent_id": self.elevenlabs_agent_id,
-                "text_input_mode": "raw", # We will send audio directly, not text
-                "sample_rate": 8000, # Twilio's media stream sample rate
-                "can_be_interrupted": True # Allow agent to be interrupted
+                "text_input_mode": "raw",
+                "sample_rate": 8000,
+                "can_be_interrupted": True
             }))
-            self.reconnect_attempts = 0 # Reset on successful connection
+            self.reconnect_attempts = 0
             return True
         except Exception as e:
             print(f"❌ Failed to connect ElevenLabs Agent WebSocket for {self.call_sid}: {e}")
@@ -126,8 +134,6 @@ class ElevenLabsAgentStream:
                 if audio_chunk is None: # Sentinel
                     break
                 if self.websocket and self.websocket.open:
-                    # ElevenLabs expects audio in a specific format (e.g., 16-bit PCM).
-                    # The `audio_chunk` passed here should already be 16-bit PCM.
                     audio_payload = base64.b64encode(audio_chunk).decode('utf-8')
                     await self.websocket.send(json.dumps({
                         "audio": audio_payload,
@@ -135,25 +141,22 @@ class ElevenLabsAgentStream:
                         "sample_rate": 8000
                     }))
                 else:
-                    print(f"WebSocket not open for {self.call_sid}, dropping audio.")
-                    # Try to reconnect if not explicitly stopped
+                    print(f"WebSocket not open for {self.call_sid}, dropping audio. Attempting reconnect...")
                     if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
                         self.reconnect_attempts += 1
                         print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
-                        await asyncio.sleep(1) # Small delay before reconnect
+                        await asyncio.sleep(1)
                         if await self._connect():
                              print(f"Reconnected for {self.call_sid}.")
                         else:
-                             print(f"Reconnect failed for {self.call_sid}. Queueing audio for next attempt.")
-                             # Re-add chunk to queue if reconnect failed to prevent loss
-                             await self.audio_queue.put(audio_chunk) # Put it back
+                             print(f"Reconnect failed for {self.call_sid}. Re-queueing audio for next attempt.")
+                             await self.audio_queue.put(audio_chunk)
                     else:
-                        print(f"Max reconnect attempts reached or stopped for {self.call_sid}. Discarding audio.")
+                        print(f"Max reconnect attempts reached or stop event set for {self.call_sid}. Discarding audio.")
 
             except Exception as e:
                 print(f"❌ Error sending audio to ElevenLabs for {self.call_sid}: {e}")
-                # Consider what to do with the audio chunk on error (requeue, discard)
-                await asyncio.sleep(0.1) # Prevent busy loop on error
+                await asyncio.sleep(0.1)
 
     async def _receive_events(self):
         while not self.stop_event.is_set():
@@ -164,25 +167,22 @@ class ElevenLabsAgentStream:
 
                     if event['type'] == 'user_transcript':
                         transcript_chunk = event['text']
-                        if transcript_chunk.strip(): # Only process non-empty transcripts
+                        if transcript_chunk.strip():
                             print(f"📝 ElevenLabs Transcript ({self.call_sid}): {transcript_chunk}")
                             call_data = live_data['active_calls'].get(self.call_sid)
                             if call_data:
                                 call_data['transcripts'].append(transcript_chunk)
-                                # Trigger analysis on this new transcript chunk
                                 analysis_result = analyze_agent_response(transcript_chunk, call_data['transcripts'])
                                 call_data['analysis'].append(analysis_result)
                                 live_data['call_stats']['analyzed_segments'] += 1
 
                                 if analysis_result and analysis_result.get('overall_score') is not None:
-                                    # Update average quality score (simple rolling average for demonstration)
                                     if live_data['call_stats']['analyzed_segments'] > 0:
                                         current_total = live_data['call_stats']['average_quality_score'] * (live_data['call_stats']['analyzed_segments'] - 1)
                                         live_data['call_stats']['average_quality_score'] = \
                                             (current_total + analysis_result['overall_score']) / live_data['call_stats']['analyzed_segments']
                                     else:
                                         live_data['call_stats']['average_quality_score'] = analysis_result['overall_score']
-
 
                                 self.socketio.emit('live_analysis', {
                                     'call_sid': self.call_sid,
@@ -191,21 +191,17 @@ class ElevenLabsAgentStream:
                                     'timestamp': datetime.now().strftime("%H:%M:%S")
                                 })
                     elif event['type'] == 'agent_output':
-                        # This is the agent's response, often TTS or text. You might want to display this too.
-                        print(f"🗣️ ElevenLabs Agent Output ({self.call_sid}): {event.get('text', '[audio]')}")
-                        # You could emit this as well if your dashboard shows agent responses.
+                        pass
                     elif event['type'] == 'pong':
-                        # Keep-alive signal, can be ignored or used for monitoring
                         pass
                     else:
                         print(f"ElevenLabs Agent Event ({self.call_sid}): {event['type']} - {event}")
 
-                else: # WebSocket not connected
-                    await asyncio.sleep(0.1) # Wait a bit before checking again
+                else:
+                    await asyncio.sleep(0.1)
 
             except websockets.exceptions.ConnectionClosedOK:
                 print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed gracefully.")
-                # Attempt to reconnect if not explicitly stopped
                 if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
                     self.reconnect_attempts += 1
                     print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
@@ -213,7 +209,7 @@ class ElevenLabsAgentStream:
                     if await self._connect():
                         print(f"Reconnected for {self.call_sid}.")
                 else:
-                    self.stop_event.set() # Stop if max reconnects hit
+                    self.stop_event.set()
             except Exception as e:
                 print(f"❌ Error receiving from ElevenLabs for {self.call_sid}: {e}")
                 if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
@@ -223,8 +219,8 @@ class ElevenLabsAgentStream:
                     if await self._connect():
                         print(f"Reconnected for {self.call_sid}.")
                 else:
-                    self.stop_event.set() # Stop if max reconnects hit
-                await asyncio.sleep(0.1) # Prevent busy loop on error
+                    self.stop_event.set()
+                await asyncio.sleep(0.1)
 
     async def _run(self):
         connected = await self._connect()
@@ -232,11 +228,10 @@ class ElevenLabsAgentStream:
             print(f"Could not establish initial connection for {self.call_sid}. Stopping stream.")
             return
 
-        # Run send and receive concurrently
         await asyncio.gather(
             self._send_audio(),
             self._receive_events(),
-            return_exceptions=False # Propagate exceptions immediately
+            return_exceptions=False
         )
         print(f"ElevenLabs Agent Stream finished for {self.call_sid}")
 
@@ -245,33 +240,34 @@ class ElevenLabsAgentStream:
         self.thread.start()
 
     def _run_async_in_thread(self):
-        # Create a new event loop for this thread
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self._run())
         self.loop.close()
         print(f"Async loop closed for ElevenLabsAgentStream for {self.call_sid}")
 
-
-    async def stop(self):
+    async def _async_stop(self):
         self.stop_event.set()
-        await self.audio_queue.put(None) # Send sentinel to stop audio sender
+        await self.audio_queue.put(None)
         if self.websocket and self.websocket.open:
             await self.websocket.close()
             print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed.")
-        # if self.loop and self.loop.is_running(): # this can cause issues if not graceful
-        #     self.loop.stop() # Attempt to stop the loop
-        #     print(f"Async loop attempted to stop for {self.call_sid}")
 
+    def stop(self):
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._async_stop(), self.loop)
+        else:
+            print(f"ElevenLabsAgentStream for {self.call_sid} is not running, no explicit stop needed.")
 
     def send_audio(self, audio_chunk_pcm):
-        """Puts a PCM audio chunk into the queue for sending."""
-        # This is called from the Flask/Twilio media stream thread
-        # Need to ensure this is thread-safe with the asyncio loop
-        if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.audio_queue.put(audio_chunk_pcm), self.loop)
+        if self.loop and self.loop.is_running() and not self.stop_event.is_set():
+            try:
+                asyncio.run_coroutine_threadsafe(self.audio_queue.put(audio_chunk_pcm), self.loop)
+            except Exception as e:
+                print(f"Error putting audio into queue for {self.call_sid}: {e}")
         else:
-            print(f"Error: ElevenLabs Agent Stream for {self.call_sid} is not running. Audio dropped.")
+            print(f"Error: ElevenLabs Agent Stream for {self.call_sid} is not running or stopped. Audio dropped.")
+
 
 # --- Background Call Monitoring Thread ---
 class LiveCallMonitor:
@@ -283,9 +279,11 @@ class LiveCallMonitor:
         if self.polling_thread is None or not self.polling_thread.is_alive():
             self.stop_event.clear()
             self.polling_thread = threading.Thread(target=self._poll_calls_loop)
-            self.polling_thread.daemon = True # Allow program to exit even if thread is running
+            self.polling_thread.daemon = True
             self.polling_thread.start()
             print("📞 Started Twilio call polling thread.")
+        else:
+            print("📞 Twilio call polling thread already running.")
 
     def stop_polling(self):
         self.stop_event.set()
@@ -299,22 +297,18 @@ class LiveCallMonitor:
             time.sleep(CALL_POLLING_INTERVAL_SECONDS)
 
     def poll_active_calls(self):
-        """Poll Twilio for active calls ONLY on specified numbers"""
         try:
             current_call_sids = set()
-            # print(f"🔍 Polling for active calls on {len(MONITOR_PHONE_NUMBERS)} numbers...")
             for phone_number in MONITOR_PHONE_NUMBERS:
-                # Check calls TO this number
                 calls_to = twilio_client.calls.list(
                     to=phone_number,
                     status='in-progress',
-                    limit=5
+                    limit=20
                 )
-                # Check calls FROM this number
                 calls_from = twilio_client.calls.list(
                     from_=phone_number,
                     status='in-progress',
-                    limit=5
+                    limit=20
                 )
                 all_calls = calls_to + calls_from
 
@@ -322,9 +316,9 @@ class LiveCallMonitor:
                     call_sid = call.sid
                     current_call_sids.add(call_sid)
                     if call_sid not in live_data['active_calls']:
-                        self.handle_new_call(call, phone_number)
+                        self.handle_new_call(call)
                     else:
-                        self.update_call(call_sid, call)
+                        self.update_call_status(call_sid, call)
 
             ended_calls = set(live_data['active_calls'].keys()) - current_call_sids
             for call_sid in ended_calls:
@@ -333,53 +327,58 @@ class LiveCallMonitor:
         except Exception as e:
             print(f"❌ Error polling calls: {e}")
 
-    def handle_new_call(self, call, phone_number):
-        """Handles a newly detected active call."""
-        print(f"🎉 New call detected: {call.sid} from {call.from_formatted} to {call.to_formatted}")
-        live_data['active_calls'][call.sid] = {
-            'number': call.from_formatted,
-            'to_number': call.to_formatted,
+    def handle_new_call(self, call_obj):
+        call_sid = call_obj.sid
+        if call_sid in live_data['active_calls']:
+            return
+
+        print(f"🎉 New call detected: {call_sid} from {call_obj.from_formatted} to {call_obj.to_formatted}")
+
+        elevenlabs_agent_stream = ElevenLabsAgentStream(
+            call_sid=call_sid,
+            elevenlabs_api_key=ELEVENLABS_API_KEY,
+            elevenlabs_agent_id=ELEVENLABS_AGENT_ID,
+            socketio_ref=socketio
+        )
+        elevenlabs_agent_stream.start()
+
+        live_data['active_calls'][call_sid] = {
+            'number': call_obj.from_formatted,
+            'to_number': call_obj.to_formatted,
             'start_time': datetime.now(),
             'duration': '00:00',
-            'status': call.status,
+            'status': call_obj.status,
             'transcripts': [],
-            'analysis': []
+            'analysis': [],
+            'elevenlabs_agent_stream': elevenlabs_agent_stream
         }
         live_data['call_stats']['total_calls'] += 1
         live_data['call_stats']['in_progress'] += 1
+        
         socketio.emit('call_started', {
-            'call_sid': call.sid,
-            'number': call.from_formatted,
-            'to_number': call.to_formatted,
-            'start_time': live_data['active_calls'][call.sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
+            'call_sid': call_sid,
+            'number': call_obj.from_formatted,
+            'to_number': call_obj.to_number, # Changed to_number for accuracy
+            'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    def update_call(self, call_sid, twilio_call_object):
-        """Updates an existing call's status and duration."""
+    def update_call_status(self, call_sid, twilio_call_object):
         if call_sid in live_data['active_calls']:
             call_data = live_data['active_calls'][call_sid]
             call_data['status'] = twilio_call_object.status
             duration_td = datetime.now() - call_data['start_time']
-            call_data['duration'] = str(duration_td).split('.')[0] # Format to HH:MM:SS
+            call_data['duration'] = str(duration_td).split('.')[0]
 
     def handle_call_end(self, call_sid):
-        """Handles an ended call."""
         if call_sid in live_data['active_calls']:
             call_data = live_data['active_calls'].pop(call_sid)
             print(f"👋 Call ended: {call_sid} (Duration: {call_data['duration']})")
             live_data['call_stats']['in_progress'] = max(0, live_data['call_stats']['in_progress'] - 1)
             live_data['call_stats']['completed'] += 1
 
-            # Stop the ElevenLabs Agent stream if it exists for this call
             elevenlabs_stream = call_data.get('elevenlabs_agent_stream')
             if elevenlabs_stream:
-                # Need to run stop coroutine in its thread's loop
-                if elevenlabs_stream.loop and elevenlabs_stream.loop.is_running():
-                    asyncio.run_coroutine_threadsafe(elevenlabs_stream.stop(), elevenlabs_stream.loop)
-                    # Optionally wait for thread to finish if not daemonized, but daemon is fine here.
-                else:
-                    print(f"ElevenLabsAgentStream for {call_sid} not running, no explicit stop needed.")
-
+                elevenlabs_stream.stop()
 
             socketio.emit('call_ended', {
                 'call_sid': call_sid,
@@ -393,10 +392,8 @@ call_monitor = LiveCallMonitor()
 
 # --- OpenAI Analysis Function ---
 def analyze_agent_response(transcript_chunk, full_transcript_history):
-    """Analyze agent response with OpenAI"""
     try:
-        # Use the full transcript history for better context, but primarily analyze the latest chunk
-        context_transcript = " ".join(full_transcript_history[-3:]) # Last 3 chunks for context
+        context_transcript = " ".join(full_transcript_history[-5:])
 
         prompt = f"""
         Analyze the *latest agent response* from the following conversation for quality metrics.
@@ -437,9 +434,11 @@ def analyze_agent_response(transcript_chunk, full_transcript_history):
 
     except json.JSONDecodeError as e:
         print(f"❌ OpenAI analysis JSON decode error: {e}. Raw response: {response.choices[0].message.content}")
-        return {'error': 'JSON Decode Error', 'message': str(e)}
+        return {'error': 'JSON Decode Error', 'message': str(e), 'overall_score': 0, 'sentiment': 'neutral'}
     except Exception as e:
         print(f"❌ OpenAI analysis error: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             'politeness': 5, 'objection_handling': 5, 'product_knowledge': 5,
             'customer_happiness': 5, 'communication_clarity': 5,
@@ -451,12 +450,10 @@ def analyze_agent_response(transcript_chunk, full_transcript_history):
 # --- Flask Routes ---
 @app.route('/')
 def dashboard():
-    """Main dashboard"""
     return render_template('dashboard.html')
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint for monitoring"""
     return jsonify({
         'status': 'healthy',
         'twilio_polling_active': call_monitor.polling_thread and call_monitor.polling_thread.is_alive(),
@@ -466,11 +463,10 @@ def health_check():
 
 @app.route('/api/stats')
 def get_stats():
-    """Get current stats"""
     return jsonify({
         'total_calls': live_data['call_stats']['total_calls'],
-        'active_calls': live_data['call_stats']['in_progress'],
-        'completed_calls': live_data['call_stats']['completed'],
+        'in_progress': live_data['call_stats']['in_progress'],
+        'completed': live_data['call_stats']['completed'],
         'analyzed_segments': live_data['call_stats']['analyzed_segments'],
         'average_quality_score': round(live_data['call_stats']['average_quality_score'], 1) if live_data['call_stats']['analyzed_segments'] > 0 else 0.0,
         'agents_count': len(set(call['to_number'] for call in live_data['active_calls'].values()))
@@ -478,7 +474,6 @@ def get_stats():
 
 @app.route('/test-twilio', methods=['GET'])
 def test_twilio():
-    """Test Twilio connection and show recent calls"""
     try:
         account = twilio_client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
         recent_calls = twilio_client.calls.list(limit=5)
@@ -497,7 +492,6 @@ def test_twilio():
 
 @app.route('/simulate-call', methods=['POST'])
 def simulate_call():
-    """Simulate a call for testing (without actual Twilio/ElevenLabs connection)"""
     try:
         fake_call_sid = f"fake_call_{int(time.time())}"
         fake_from = "+15551234567"
@@ -510,7 +504,8 @@ def simulate_call():
             'duration': '00:00',
             'status': 'in-progress',
             'transcripts': [],
-            'analysis': []
+            'analysis': [],
+            'elevenlabs_agent_stream': None
         }
         live_data['call_stats']['total_calls'] += 1
         live_data['call_stats']['in_progress'] += 1
@@ -525,7 +520,7 @@ def simulate_call():
         })
 
         def generate_fake_transcript_and_analysis():
-            time.sleep(3) # Simulate call starting
+            time.sleep(3)
             fake_segments = [
                 "Hello, thank you for calling. How may I assist you today?",
                 "I understand you're having an issue with your internet connection. Let me check that for you.",
@@ -535,7 +530,7 @@ def simulate_call():
             ]
             for i, segment in enumerate(fake_segments):
                 if fake_call_sid not in live_data['active_calls']:
-                    break # Call ended during simulation
+                    break
 
                 call_data = live_data['active_calls'].get(fake_call_sid)
                 if call_data:
@@ -559,9 +554,9 @@ def simulate_call():
                         'analysis_result': analysis_result,
                         'timestamp': datetime.now().strftime("%H:%M:%S")
                     })
-                time.sleep(5) # Simulate delay between segments
+                time.sleep(5)
 
-            time.sleep(5) # Simulate call ending
+            time.sleep(5)
             if fake_call_sid in live_data['active_calls']:
                 call_monitor.handle_call_end(fake_call_sid)
 
@@ -575,7 +570,6 @@ def simulate_call():
 
 @app.route('/webhook/call-start', methods=['POST'])
 def twilio_call_start():
-    """Twilio webhook when call starts - initiates media stream and ElevenLabs agent stream."""
     from twilio.twiml.voice_response import VoiceResponse
 
     call_sid = request.form.get('CallSid')
@@ -584,106 +578,55 @@ def twilio_call_start():
 
     print(f"🔔 Twilio webhook: Call {call_sid} from {from_number} to {to_number}")
 
-    # Initialize ElevenLabs Agent Stream for this call
-    elevenlabs_agent_stream = ElevenLabsAgentStream(
-        call_sid=call_sid,
-        elevenlabs_api_key=ELEVENLABS_API_KEY,
-        elevenlabs_agent_id=ELEVENLABS_AGENT_ID,
-        socketio_ref=socketio # Pass socketio reference for emitting
-    )
-    elevenlabs_agent_stream.start() # Start the separate thread for ElevenLabs WebSocket
+    call_obj = twilio_client.calls(call_sid).fetch()
+    call_monitor.handle_new_call(call_obj)
 
-    # Store the stream object in live_data
-    live_data['active_calls'][call_sid] = {
-        'number': from_number,
-        'to_number': to_number,
-        'start_time': datetime.now(),
-        'duration': '00:00',
-        'status': 'in-progress',
-        'transcripts': [],
-        'analysis': [],
-        'elevenlabs_agent_stream': elevenlabs_agent_stream # Store the stream manager
-    }
-    live_data['call_stats']['total_calls'] += 1
-    live_data['call_stats']['in_progress'] += 1
-
-    # Create TwiML response with media streaming
     response = VoiceResponse()
-    # The URL for the stream should be accessible from Twilio.
-    # On Koyeb/Heroku, this would be your app's public URL.
     stream_url = f'wss://{request.host}/audio-stream/{call_sid}'
     response.start().stream(
         url=stream_url,
-        track='both_tracks' # Stream audio from both agent and customer
+        track='both_tracks'
     )
-    # Connect the call to its destination (e.g., an agent, another number)
     response.dial(to_number)
-
-    # Emit to dashboard that call started
-    socketio.emit('call_started', {
-        'call_sid': call_sid,
-        'number': from_number,
-        'to_number': to_number,
-        'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
-    })
 
     return str(response)
 
 @app.route('/webhook/call-end', methods=['POST'])
 def twilio_call_end():
-    """Twilio webhook when call ends"""
     call_sid = request.form.get('CallSid')
-    # duration = int(request.form.get('CallDuration', 0)) # CallDuration isn't always reliable directly after end
-
     print(f"🔚 Call ended webhook received for: {call_sid}")
-
-    # The LiveCallMonitor's handle_call_end will clean up the ElevenLabs stream
     call_monitor.handle_call_end(call_sid)
-
     return '', 200
 
+# --- Flask-SocketIO Event Handlers for Twilio Media Stream ---
 @socketio.on('connect', namespace='/audio-stream')
 def handle_audio_stream_connect():
-    """Handles Twilio Media Stream WebSocket connections."""
     print(f"🎧 Twilio Media Stream WebSocket connected.")
 
 @socketio.on('message', namespace='/audio-stream')
 def handle_media_stream_message(message):
-    """Processes incoming audio from Twilio Media Stream."""
-    # Twilio sends messages as JSON
-    # This endpoint gets 'message' type events from Twilio (not 'media')
-    # Twilio Docs: https://www.twilio.com/docs/voice/api/streaming#message-payload-description
     try:
-        # if isinstance(message, str): # messages could be strings if not JSON
-        #     payload = json.loads(message)
-        # else:
-        payload = message # Flask-SocketIO might already parse JSON
+        payload = message
 
         event_type = payload.get('event')
-        call_sid = payload.get('call_sid') # Use call_sid directly if present, or infer from streamSid later
+        call_sid = payload.get('call_sid')
 
-        # Twilio Media Stream events: 'start', 'media', 'stop', 'mark'
         if event_type == 'start':
-            # This is sent once at the beginning of the stream
             print(f"Twilio Media Stream 'start' event for CallSid: {call_sid}")
+            if call_sid not in live_data['active_calls']:
+                call_obj = twilio_client.calls(call_sid).fetch()
+                call_monitor.handle_new_call(call_obj)
         elif event_type == 'media':
-            # This is where the actual audio data comes in
-            chunk_id = payload['sequence_number']
             audio_payload = payload['media']['payload']
-            # audio_chunk_type = payload['media']['chunk'] # "start", "middle", "end"
 
             if call_sid and call_sid in live_data['active_calls']:
                 call_data = live_data['active_calls'][call_sid]
                 elevenlabs_stream = call_data.get('elevenlabs_agent_stream')
 
                 if elevenlabs_stream:
-                    # Decode base64 audio (mulaw from Twilio)
                     audio_data_mulaw = base64.b64decode(audio_payload)
-                    # Convert mulaw to 16-bit linear PCM (ElevenLabs expects PCM)
-                    # Twilio's audio is typically 8kHz mono mulaw
-                    pcm_audio = audioop.ulaw2lin(audio_data_mulaw, 2) # 2 bytes per sample = 16-bit
+                    pcm_audio = audioop.ulaw2lin(audio_data_mulaw, 2)
 
-                    # Send PCM audio to the ElevenLabs Agent Stream queue
                     elevenlabs_stream.send_audio(pcm_audio)
                 else:
                     print(f"No ElevenLabs Agent Stream found for Call SID {call_sid}. Audio dropped.")
@@ -692,11 +635,8 @@ def handle_media_stream_message(message):
 
         elif event_type == 'stop':
             print(f"Twilio Media Stream 'stop' event for CallSid: {call_sid}")
-            # The call_end webhook should handle clean up, but can add redundancy here.
-            # However, avoid race conditions if handle_call_end is already running.
+            call_monitor.handle_call_end(call_sid)
 
-    except json.JSONDecodeError as e:
-        print(f"❌ Error decoding Twilio Media Stream JSON: {e} - Message: {message}")
     except Exception as e:
         print(f"❌ Error handling Twilio Media Stream message: {e}")
         import traceback
@@ -704,21 +644,18 @@ def handle_media_stream_message(message):
 
 @socketio.on('disconnect', namespace='/audio-stream')
 def handle_audio_stream_disconnect():
-    """Handles disconnection of Twilio Media Stream WebSocket."""
     print("🎧 Twilio Media Stream WebSocket disconnected.")
-    # Note: Flask-SocketIO's disconnect event doesn't easily provide the CallSid
-    # You would need to map session IDs to CallSids if you want to clean up
-    # ElevenLabs streams here. Best to rely on the /webhook/call-end for cleanup.
 
 
+# --- Flask-SocketIO Event Handlers for Dashboard Frontend ---
 @socketio.on('connect')
 def handle_dashboard_connect():
-    """WebSocket connection from dashboard frontend"""
-    emit('connected', {'status': 'Connected to live call monitoring'})
+    print("🌐 Dashboard client connected via WebSocket.")
+    emit('connected', {'status': 'Connected to live call monitoring system!'})
+    handle_get_live_data()
 
 @socketio.on('get_live_data')
 def handle_get_live_data():
-    """Send live dashboard data"""
     active_calls_data = []
 
     for call_sid, call_info in live_data['active_calls'].items():
@@ -755,16 +692,12 @@ if __name__ == '__main__':
     print("▶️  Starting Twilio call polling automatically...")
     print("="*50 + "\n")
 
-    # Start the Twilio call polling thread immediately
     call_monitor.start_polling()
 
-    # Important: For Gunicorn deployment, use the `create_app` function.
-    # For local dev, run with `python app.py` which will use Flask's dev server.
-    socketio.run(app, debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)), allow_unsafe_werkzeug=True) # allow_unsafe_werkzeug for older Flask/Werkzeug versions with Flask-SocketIO
+    socketio.run(app, debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)), allow_unsafe_werkzeug=True)
 
-# For gunicorn deployment
-def create_app():
-    # Only start background polling here if you're sure it runs once per process
-    # Or, preferably, run the LiveCallMonitor in a separate worker Dyno/process
-    call_monitor.start_polling() # Ensure this only starts once
-    return app
+# Gunicorn entry point (used by Koyeb)
+# WARNING: This setup will only work correctly with a SINGLE Gunicorn worker.
+# If Gunicorn is configured with multiple workers (default for some platforms),
+# real-time updates and inter-call communication via WebSockets will be unreliable.
+# For multi-worker setups, a message queue like Redis IS REQUIRED for Flask-SocketIO.
