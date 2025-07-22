@@ -1,491 +1,156 @@
 import os
-import asyncio
-import base64
 import json
 import uuid
-import time
-import queue
 import threading
-import collections
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
-from twilio.rest import Client
 import openai
-import audioop # This is a built-in module, no need to pip install
-import websockets
-import aiohttp # Used by websockets for async HTTP connections
+from werkzeug.utils import secure_filename
 
-# Import the ElevenLabs Client
-from elevenlabs.client import ElevenLabs
-from elevenlabs import Voice, VoiceSettings, play
-
-# Load environment variables from .env file (for local development)
+# Load environment variables
 load_dotenv()
 
 # --- Configuration ---
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 ELEVENLABS_API_KEY = os.environ.get('ELEVENLABS_API_KEY')
-ELEVENLABS_AGENT_ID = os.environ.get('ELEVENLABS_AGENT_ID')
+XELION_API_KEY = os.environ.get('XELION_API_KEY', '')
 
-MONITOR_PHONE_NUMBERS_STR = os.environ.get('MONITOR_PHONE_NUMBERS', '')
-MONITOR_PHONE_NUMBERS = [num.strip() for num in MONITOR_PHONE_NUMBERS_STR.split(',') if num.strip()]
+# File upload settings
+UPLOAD_FOLDER = 'audio_uploads'
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a'}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
-ANALYSIS_INTERVAL_SECONDS = int(os.environ.get('ANALYSIS_INTERVAL_SECONDS', 10))
-CALL_POLLING_INTERVAL_SECONDS = int(os.environ.get('CALL_POLLING_INTERVAL_SECONDS', 15))
-
-# Secret key for Flask and Flask-SocketIO (essential for sessions and security)
-# !!! IMPORTANT: Replace 'your_super_secret_default_key_replace_me_in_prod' with a strong, random key in production !!!
+# Secret key for Flask
 SECRET_KEY = os.environ.get('SECRET_KEY', 'your_super_secret_default_key_replace_me_in_prod')
 
-
 # --- Input Validation ---
-if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, SECRET_KEY]):
-    print("❌ Missing environment variables! Ensure TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, and SECRET_KEY are set.")
+if not all([OPENAI_API_KEY, ELEVENLABS_API_KEY, SECRET_KEY]):
+    print("❌ Missing environment variables! Ensure OPENAI_API_KEY, ELEVENLABS_API_KEY, and SECRET_KEY are set.")
     exit(1)
 
-if not MONITOR_PHONE_NUMBERS:
-    print("❌ No phone numbers specified! Add your Twilio numbers to MONITOR_PHONE_NUMBERS environment variable (comma-separated).")
-    exit(1)
+# Create upload directory
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- Initialize Clients ---
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 openai.api_key = OPENAI_API_KEY
-elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
 
 # --- Flask App Setup ---
 app = Flask(__name__)
-
-# Configure Flask app with the SECRET_KEY
 app.config['SECRET_KEY'] = SECRET_KEY
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
-# Initialize Flask-SocketIO WITHOUT a message queue
-# This means it will ONLY work correctly with a single Gunicorn worker.
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*", # Adjust for production security if needed
-    async_mode='threading' # Still good to specify, as you have threads
+    cors_allowed_origins="*",
+    async_mode='threading'
 )
 
-# --- Global Data Stores (In-memory for simplicity) ---
-# Note: With multiple workers and no Redis, these in-memory stores would NOT be shared.
-# However, since we're forcing a single worker, this is okay.
-live_data = {
-    'active_calls': {},
-    'call_stats': {
+# --- Global Data Stores ---
+call_data_store = {
+    'completed_calls': {},  # call_id -> call data
+    'daily_stats': {},      # date -> stats
+    'overall_stats': {
         'total_calls': 0,
-        'in_progress': 0,
-        'completed': 0,
-        'analyzed_segments': 0,
-        'average_quality_score': 0.0
+        'successful_calls': 0,
+        'failed_calls': 0,
+        'positive_interactions': 0,
+        'negative_interactions': 0,
+        'neutral_interactions': 0,
+        'average_call_duration': 0.0,
+        'total_call_duration': 0.0,
+        'kpi_averages': {}
     }
 }
 
-# --- ElevenLabs Conversational AI Stream Manager ---
-class ElevenLabsAgentStream:
-    def __init__(self, call_sid, elevenlabs_api_key, elevenlabs_agent_id, socketio_ref):
-        self.call_sid = call_sid
-        self.elevenlabs_api_key = elevenlabs_api_key
-        self.elevenlabs_agent_id = elevenlabs_agent_id
-        self.socketio = socketio_ref
-        self.websocket = None
-        self.audio_queue = asyncio.Queue()
-        self.stop_event = asyncio.Event()
-        self.thread = None
-        self.loop = None # Initialize loop as None
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5
-        print(f"ElevenLabsAgentStream initialized for Call SID: {self.call_sid}")
-        # --- DEBUG PRINT (Crucial for verifying agent_id value) ---
-        print(f"DEBUG: ElevenLabsAgentStream for {self.call_sid} initialized with agent_id: '{self.elevenlabs_agent_id}'")
-        # --- END DEBUG PRINT ---
-
-    async def _connect(self):
-        # --- MODIFIED: Include agent_id in the URL query parameters ---
-        if not self.elevenlabs_agent_id:
-            print("❌ ELEVENLABS_AGENT_ID is missing or empty. Cannot connect to ElevenLabs Conversational AI.")
-            # Do not raise ValueError here, just return False and let _run handle it
-            return False
-
-        base_ws_url = "wss://api.elevenlabs.io/v1/convai/conversation"
-        ws_url = f"{base_ws_url}?agent_id={self.elevenlabs_agent_id}"
-
-        headers = {
-            "xi-api-key": self.elevenlabs_api_key,
-            "Content-Type": "application/json" # This header is good for the initial payload
-        }
-        try:
-            # Attempt to establish the WebSocket connection
-            self.websocket = await websockets.connect(ws_url, extra_headers=headers)
-            print(f"✅ ElevenLabs Agent WebSocket connected for {self.call_sid} to URL: {ws_url}")
-
-            # Send the initial configuration message
-            # REMOVED agent_id from this JSON as it's now in the URL
-            await self.websocket.send(json.dumps({
-                "api_key": self.elevenlabs_api_key,
-                "text_input_mode": "raw",
-                "sample_rate": 8000,
-                "can_be_interrupted": True
-            }))
-            self.reconnect_attempts = 0
-            return True # Indicate successful connection and initial setup
-        except Exception as e:
-            # Handle connection failure
-            print(f"❌ Failed to connect ElevenLabs Agent WebSocket for {self.call_sid}: {e}")
-            self.websocket = None # Ensure websocket is None on failure
-            return False # Indicate connection failure
-
-    async def _send_audio(self):
-        while not self.stop_event.is_set():
-            try:
-                audio_chunk = await self.audio_queue.get()
-                if audio_chunk is None: # Sentinel to break loop gracefully
-                    break
-                if self.websocket and self.websocket.open:
-                    audio_payload = base64.b64encode(audio_chunk).decode('utf-8')
-                    await self.websocket.send(json.dumps({
-                        "audio": audio_payload,
-                        "content_type": "audio/pcm",
-                        "sample_rate": 8000
-                    }))
-                else:
-                    print(f"WebSocket not open for {self.call_sid}, dropping audio. Attempting reconnect...")
-                    if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
-                        self.reconnect_attempts += 1
-                        print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
-                        await asyncio.sleep(1)
-                        if await self._connect():
-                            print(f"Reconnected for {self.call_sid}.")
-                        else:
-                            print(f"Reconnect failed for {self.call_sid}. Re-queueing audio for next attempt.")
-                            # Re-queue the audio if reconnect fails to attempt sending it later
-                            await self.audio_queue.put(audio_chunk)
-                    else:
-                        print(f"Max reconnect attempts reached or stop event set for {self.call_sid}. Discarding audio.")
-
-            except Exception as e:
-                print(f"❌ Error sending audio to ElevenLabs for {self.call_sid}: {e}")
-                await asyncio.sleep(0.1) # Small delay to prevent tight loop on error
-
-    async def _receive_events(self):
-        while not self.stop_event.is_set():
-            try:
-                if self.websocket:
-                    message = await self.websocket.recv()
-                    event = json.loads(message)
-
-                    if event['type'] == 'user_transcript':
-                        transcript_chunk = event['text']
-                        if transcript_chunk.strip():
-                            print(f"📝 ElevenLabs Transcript ({self.call_sid}): {transcript_chunk}")
-                            call_data = live_data['active_calls'].get(self.call_sid)
-                            if call_data:
-                                call_data['transcripts'].append(transcript_chunk)
-                                # Pass full transcript history for context
-                                analysis_result = analyze_agent_response(transcript_chunk, call_data['transcripts'])
-                                call_data['analysis'].append(analysis_result)
-                                live_data['call_stats']['analyzed_segments'] += 1
-
-                                if analysis_result and analysis_result.get('overall_score') is not None:
-                                    if live_data['call_stats']['analyzed_segments'] > 0:
-                                        current_total = live_data['call_stats']['average_quality_score'] * (live_data['call_stats']['analyzed_segments'] - 1)
-                                        live_data['call_stats']['average_quality_score'] = \
-                                            (current_total + analysis_result['overall_score']) / live_data['call_stats']['analyzed_segments']
-                                    else:
-                                        live_data['call_stats']['average_quality_score'] = analysis_result['overall_score']
-
-                                self.socketio.emit('live_analysis', {
-                                    'call_sid': self.call_sid,
-                                    'transcript_chunk': transcript_chunk,
-                                    'analysis_result': analysis_result,
-                                    'timestamp': datetime.now().strftime("%H:%M:%S")
-                                })
-                    elif event['type'] == 'agent_output':
-                        # Handle agent audio output here if needed, e.g., send to Twilio
-                        pass
-                    elif event['type'] == 'pong':
-                        # Handle pong messages to keep connection alive if necessary
-                        pass
-                    else:
-                        print(f"ElevenLabs Agent Event ({self.call_sid}): {event['type']} - {event}")
-
-                else:
-                    await asyncio.sleep(0.1) # Small delay if WebSocket is not yet connected
-
-            except websockets.exceptions.ConnectionClosedOK:
-                print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed gracefully.")
-                if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
-                    self.reconnect_attempts += 1
-                    print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
-                    await asyncio.sleep(1)
-                    if await self._connect():
-                        print(f"Reconnected for {self.call_sid}.")
-                else:
-                    self.stop_event.set() # Stop if max reconnects reached or explicitly stopped
-            except Exception as e:
-                print(f"❌ Error receiving from ElevenLabs for {self.call_sid}: {e}")
-                if not self.stop_event.is_set() and self.reconnect_attempts < self.max_reconnect_attempts:
-                    self.reconnect_attempts += 1
-                    print(f"Attempting reconnect for {self.call_sid} (Attempt {self.reconnect_attempts})...")
-                    await asyncio.sleep(1)
-                    if await self._connect():
-                        print(f"Reconnected for {self.call_sid}.")
-                else:
-                    self.stop_event.set() # Stop if max reconnects reached or explicitly stopped
-                await asyncio.sleep(0.1) # Small delay to prevent tight loop on error
-
-    async def _run(self):
-        # This is where the core async logic runs.
-        # It should only be run once per stream instance.
-        connected = await self._connect()
-        if not connected:
-            print(f"Could not establish initial connection for {self.call_sid}. Stopping stream.")
-            self.stop_event.set() # Ensure stop event is set if initial connect fails
-            return
-
-        # Run send and receive tasks concurrently
-        await asyncio.gather(
-            self._send_audio(),
-            self._receive_events(),
-            return_exceptions=False # Allows handling exceptions within each coroutine
-        )
-        print(f"ElevenLabs Agent Stream finished for {self.call_sid}")
-
-    def start(self):
-        # If a thread already exists and is alive, do not start a new one.
-        if self.thread is None or not self.thread.is_alive():
-            self.stop_event.clear() # Clear stop event for a new start
-            self.thread = threading.Thread(target=self._run_async_in_thread, daemon=True)
-            self.thread.start()
-            print(f"Started ElevenLabsAgentStream thread for {self.call_sid}")
-        else:
-            print(f"ElevenLabsAgentStream thread for {self.call_sid} already running or not properly shut down. Skipping start.")
-
-
-    def _run_async_in_thread(self):
-        # Each thread needs its own asyncio event loop
-        # Ensure a new event loop is created ONLY if one isn't already set for this thread
-        try:
-            # Attempt to get the current event loop. If none, a new one needs to be created.
-            self.loop = asyncio.get_event_loop()
-            print(f"Re-using existing event loop for {self.call_sid} in thread {threading.current_thread().name}")
-        except RuntimeError:
-            # No current event loop, create a new one
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            print(f"Created new event loop for {self.call_sid} in thread {threading.current_thread().name}")
-
-        try:
-            self.loop.run_until_complete(self._run())
-        except Exception as e:
-            print(f"❌ Error in ElevenLabsAgentStream thread for {self.call_sid}: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Ensure proper cleanup
-            if self.loop and not self.loop.is_closed():
-                # Cancel all remaining tasks in the loop before closing
-                for task in asyncio.all_tasks(self.loop):
-                    task.cancel()
-                # Run the loop briefly to allow tasks to finish canceling
-                try:
-                    self.loop.run_until_complete(asyncio.sleep(0.1))
-                except asyncio.CancelledError:
-                    pass # Expected if tasks were cancelled
-                self.loop.close()
-                print(f"Async loop closed for ElevenLabsAgentStream for {self.call_sid}")
-            self.loop = None # Dereference the loop
-
-    async def _async_stop(self):
-        # Set stop event to signal coroutines to exit
-        self.stop_event.set()
-        await self.audio_queue.put(None) # Put sentinel to unblock _send_audio
-        if self.websocket and self.websocket.open:
-            await self.websocket.close() # Close the WebSocket connection
-            print(f"ElevenLabs Agent WebSocket for {self.call_sid} closed.")
-
-    def stop(self):
-        # Schedule the async stop method to run in the stream's event loop
-        if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._async_stop(), self.loop)
-            # Give some time for the stop to propagate and the thread to finish
-            if self.thread and self.thread.is_alive():
-                self.thread.join(timeout=5) # Wait for thread to finish for up to 5 seconds
-                if self.thread.is_alive():
-                    print(f"Warning: ElevenLabsAgentStream thread for {self.call_sid} did not terminate gracefully.")
-        else:
-            print(f"ElevenLabsAgentStream for {self.call_sid} is not running, no explicit stop needed.")
-
-
-    def send_audio(self, audio_chunk_pcm):
-        # Add audio chunk to the queue from a different thread (e.g., Flask request handler)
-        if self.loop and self.loop.is_running() and not self.stop_event.is_set():
-            try:
-                asyncio.run_coroutine_threadsafe(self.audio_queue.put(audio_chunk_pcm), self.loop)
-            except Exception as e:
-                print(f"Error putting audio into queue for {self.call_sid}: {e}")
-        else:
-            print(f"Error: ElevenLabs Agent Stream for {self.call_sid} is not running or stopped. Audio dropped.")
-
-
-# --- Background Call Monitoring Thread ---
-class LiveCallMonitor:
-    def __init__(self):
-        self.polling_thread = None
-        self.stop_event = threading.Event()
-
-    def start_polling(self):
-        if self.polling_thread is None or not self.polling_thread.is_alive():
-            self.stop_event.clear()
-            self.polling_thread = threading.Thread(target=self._poll_calls_loop)
-            self.polling_thread.daemon = True
-            self.polling_thread.start()
-            print("📞 Started Twilio call polling thread.")
-        else:
-            print("📞 Twilio call polling thread already running.")
-
-    def stop_polling(self):
-        self.stop_event.set()
-        if self.polling_thread and self.polling_thread.is_alive():
-            self.polling_thread.join(timeout=5)
-            print("📞 Stopped Twilio call polling thread.")
-
-    def _poll_calls_loop(self):
-        while not self.stop_event.is_set():
-            self.poll_active_calls()
-            time.sleep(CALL_POLLING_INTERVAL_SECONDS)
-
-    def poll_active_calls(self):
-        try:
-            current_call_sids = set()
-            for phone_number in MONITOR_PHONE_NUMBERS:
-                calls_to = twilio_client.calls.list(
-                    to=phone_number,
-                    status='in-progress',
-                    limit=20
-                )
-                calls_from = twilio_client.calls.list(
-                    from_=phone_number,
-                    status='in-progress',
-                    limit=20
-                )
-                all_calls = calls_to + calls_from
-
-                for call in all_calls:
-                    call_sid = call.sid
-                    current_call_sids.add(call_sid)
-                    if call_sid not in live_data['active_calls']:
-                        self.handle_new_call(call)
-                    else:
-                        self.update_call_status(call_sid, call)
-
-            ended_calls = set(live_data['active_calls'].keys()) - current_call_sids
-            for call_sid in ended_calls:
-                self.handle_call_end(call_sid)
-
-        except Exception as e:
-            print(f"❌ Error polling calls: {e}")
-
-    def handle_new_call(self, call_obj):
-        call_sid = call_obj.sid
-        if call_sid in live_data['active_calls']:
-            # This call is already being tracked, possibly from a duplicate webhook
-            # or rapid polling. Do not re-initialize the stream.
-            print(f"Call {call_sid} already active. Skipping re-initialization.")
-            return
-
-        print(f"🎉 New call detected: {call_sid} from {call_obj.from_formatted} to {call_obj.to_formatted}")
-
-        elevenlabs_agent_stream = ElevenLabsAgentStream(
-            call_sid=call_sid,
-            elevenlabs_api_key=ELEVENLABS_API_KEY,
-            elevenlabs_agent_id=ELEVENLABS_AGENT_ID,
-            socketio_ref=socketio
-        )
-        elevenlabs_agent_stream.start()
-
-        live_data['active_calls'][call_sid] = {
-            'number': call_obj.from_formatted,
-            'to_number': call_obj.to_formatted,
-            'start_time': datetime.now(),
-            'duration': '00:00',
-            'status': call_obj.status,
-            'transcripts': [],
-            'analysis': [],
-            'elevenlabs_agent_stream': elevenlabs_agent_stream
-        }
-        live_data['call_stats']['total_calls'] += 1
-        live_data['call_stats']['in_progress'] += 1
-        
-        socketio.emit('call_started', {
-            'call_sid': call_sid,
-            'number': call_obj.from_formatted,
-            'to_number': call_obj.to_formatted,
-            'start_time': live_data['active_calls'][call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
-        })
-
-    def update_call_status(self, call_sid, twilio_call_object):
-        if call_sid in live_data['active_calls']:
-            call_data = live_data['active_calls'][call_sid]
-            call_data['status'] = twilio_call_object.status
-            duration_td = datetime.now() - call_data['start_time']
-            call_data['duration'] = str(duration_td).split('.')[0]
-
-    def handle_call_end(self, call_sid):
-        if call_sid in live_data['active_calls']:
-            call_data = live_data['active_calls'].pop(call_sid)
-            print(f"👋 Call ended: {call_sid} (Duration: {call_data['duration']})")
-            live_data['call_stats']['in_progress'] = max(0, live_data['call_stats']['in_progress'] - 1)
-            live_data['call_stats']['completed'] += 1
-
-            elevenlabs_stream = call_data.get('elevenlabs_agent_stream')
-            if elevenlabs_stream:
-                elevenlabs_stream.stop()
-
-            socketio.emit('call_ended', {
-                'call_sid': call_sid,
-                'duration': call_data['duration'],
-                'final_transcripts': call_data['transcripts'],
-                'final_analysis': call_data['analysis']
-            })
-
-call_monitor = LiveCallMonitor()
-
-
-# --- OpenAI Analysis Function ---
-def analyze_agent_response(transcript_chunk, full_transcript_history):
+# --- Enhanced KPI Analysis Function ---
+def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
+    """
+    Analyze call transcript with 18 comprehensive KPIs for call success/failure and user sentiment
+    """
     try:
-        context_transcript = " ".join(full_transcript_history[-5:])
-
         prompt = f"""
-        Analyze the *latest agent response* from the following conversation for quality metrics.
-        The full conversation context is: "{context_transcript}"
+        Analyze this complete call transcript for comprehensive quality metrics and determine call success/failure.
+        
+        Call Metadata:
+        - Duration: {call_metadata.get('duration', 'unknown')} seconds
+        - Agent ID: {call_metadata.get('agent_id', 'unknown')}
+        - Call Type: {call_metadata.get('call_type', 'unknown')}
+        - Source: {call_metadata.get('source', 'unknown')}
+        
+        Transcript: "{transcript}"
 
-        Latest Agent Response: "{transcript_chunk}"
+        Provide analysis on these 18 KPIs (rate 1-10, where 1=poor, 10=excellent):
 
-        Rate each factor from 1-10 (1 being poor, 10 being excellent) and provide short strengths/improvements.
-        Return ONLY valid JSON.
-        Factors to rate: politeness, objection_handling, product_knowledge, customer_happiness, communication_clarity, problem_resolution, listening_skills, empathy.
+        **Call Success & Resolution KPIs:**
+        1. call_success_rate - Was the customer's primary issue/request resolved successfully?
+        2. first_call_resolution - Was the issue resolved without requiring callbacks or escalation?
+        3. issue_identification - How well did the agent identify and understand the customer's problem?
+        4. solution_effectiveness - How effective was the solution provided to the customer?
 
-        Example JSON structure:
+        **Customer Experience & Sentiment KPIs:**
+        5. customer_satisfaction - Overall customer happiness and satisfaction level
+        6. user_interaction_sentiment - Customer's emotional journey (frustrated->satisfied, etc.)
+        7. customer_effort_score - How easy was it for the customer to get their issue resolved?
+        8. wait_time_satisfaction - Customer satisfaction with response times and call flow
+
+        **Agent Performance KPIs:**
+        9. communication_clarity - How clearly and understandably did the agent communicate?
+        10. listening_skills - How well did the agent listen and understand customer needs?
+        11. empathy_emotional_intelligence - Agent's empathy and emotional connection with customer
+        12. product_service_knowledge - Agent's knowledge of products, services, and company policies
+        13. call_control_flow - Agent's ability to guide and manage the conversation effectively
+        14. professionalism_courtesy - Professional demeanor, politeness, and appropriate language use
+
+        **Operational Efficiency KPIs:**
+        15. call_handling_efficiency - Appropriate call length relative to issue complexity
+        16. information_gathering - How effectively did the agent gather necessary customer information?
+        17. follow_up_commitment - Clear next steps, commitments, and follow-up arrangements
+        18. compliance_adherence - Following company scripts, policies, and regulatory requirements
+
+        **Overall Assessment:**
+        - call_outcome: "success" | "failure" | "partial_success"
+        - interaction_sentiment: "positive" | "negative" | "neutral" | "mixed"
+        - primary_reason: Brief specific reason for the outcome (max 50 characters)
+        - customer_emotion_start: Customer's initial emotional state
+        - customer_emotion_end: Customer's final emotional state
+        - agent_performance_rating: Overall agent performance (1-10)
+
+        Return ONLY valid JSON in this exact format:
         {{
-            "politeness": 8,
-            "objection_handling": 7,
-            "product_knowledge": 8,
-            "customer_happiness": 7,
+            "call_success_rate": 8,
+            "first_call_resolution": 7,
+            "issue_identification": 8,
+            "solution_effectiveness": 7,
+            "customer_satisfaction": 8,
+            "user_interaction_sentiment": 7,
+            "customer_effort_score": 8,
+            "wait_time_satisfaction": 6,
             "communication_clarity": 9,
-            "problem_resolution": 6,
             "listening_skills": 8,
-            "empathy": 7,
-            "overall_score": 8,
-            "strengths": ["clear communication"],
-            "improvements": ["more empathy"],
-            "sentiment": "positive"
+            "empathy_emotional_intelligence": 7,
+            "product_service_knowledge": 8,
+            "call_control_flow": 8,
+            "information_gathering": 7,
+            "follow_up_commitment": 6,
+            "compliance_adherence": 8,
+            "call_handling_efficiency": 7,
+            "professionalism_courtesy": 9,
+            "overall_score": 7.7,
+            "call_outcome": "success",
+            "interaction_sentiment": "positive",
+            "primary_reason": "Billing issue resolved efficiently",
+            "customer_emotion_start": "frustrated",
+            "customer_emotion_end": "satisfied",
+            "agent_performance_rating": 8,
+            "strengths": ["clear communication", "good product knowledge", "professional manner"],
+            "improvements": ["could improve follow-up process", "faster information gathering"],
+            "key_moments": ["Customer initially frustrated about bill", "Agent explained charges clearly", "Customer thanked agent at end"],
+            "call_tags": ["billing", "resolved", "positive_outcome"]
         }}
         """
 
@@ -493,279 +158,463 @@ def analyze_agent_response(transcript_chunk, full_transcript_history):
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=300
+            max_tokens=1000
         )
 
         result = json.loads(response.choices[0].message.content)
+        
+        # Ensure all required KPI fields are present with default values
+        required_kpis = [
+            "call_success_rate", "first_call_resolution", "issue_identification", "solution_effectiveness",
+            "customer_satisfaction", "user_interaction_sentiment", "customer_effort_score", "wait_time_satisfaction",
+            "communication_clarity", "listening_skills", "empathy_emotional_intelligence", "product_service_knowledge",
+            "call_control_flow", "information_gathering", "follow_up_commitment", "compliance_adherence",
+            "call_handling_efficiency", "professionalism_courtesy"
+        ]
+        
+        for kpi in required_kpis:
+            if kpi not in result:
+                result[kpi] = 5  # Default neutral score
+                
+        # Calculate overall score if not provided
+        if "overall_score" not in result:
+            kpi_scores = [result.get(kpi, 5) for kpi in required_kpis]
+            result["overall_score"] = round(sum(kpi_scores) / len(kpi_scores), 1)
+                
         return result
 
     except json.JSONDecodeError as e:
-        print(f"❌ OpenAI analysis JSON decode error: {e}. Raw response: {response.choices[0].message.content}")
-        return {'error': 'JSON Decode Error', 'message': str(e), 'overall_score': 0, 'sentiment': 'neutral'}
+        print(f"❌ OpenAI analysis JSON decode error: {e}")
+        return create_default_analysis_result(error=f"JSON Decode Error: {str(e)}")
     except Exception as e:
         print(f"❌ OpenAI analysis error: {e}")
         import traceback
         traceback.print_exc()
-        return {
-            'politeness': 5, 'objection_handling': 5, 'product_knowledge': 5,
-            'customer_happiness': 5, 'communication_clarity': 5,
-            'problem_resolution': 5, 'listening_skills': 5, 'empathy': 5,
-            'overall_score': 5, 'strengths': ['Error during analysis'], 'improvements': [], 'sentiment': 'neutral'
-        }
+        return create_default_analysis_result(error=f"Analysis Error: {str(e)}")
 
+def create_default_analysis_result(error: str = "Unknown error") -> Dict:
+    """Create default analysis result when analysis fails"""
+    default_kpis = {
+        "call_success_rate": 5, "first_call_resolution": 5, "issue_identification": 5, "solution_effectiveness": 5,
+        "customer_satisfaction": 5, "user_interaction_sentiment": 5, "customer_effort_score": 5, "wait_time_satisfaction": 5,
+        "communication_clarity": 5, "listening_skills": 5, "empathy_emotional_intelligence": 5, "product_service_knowledge": 5,
+        "call_control_flow": 5, "information_gathering": 5, "follow_up_commitment": 5, "compliance_adherence": 5,
+        "call_handling_efficiency": 5, "professionalism_courtesy": 5
+    }
+    
+    return {
+        **default_kpis,
+        "overall_score": 5.0,
+        "call_outcome": "unknown",
+        "interaction_sentiment": "neutral",
+        "primary_reason": f"Analysis failed: {error}",
+        "customer_emotion_start": "unknown",
+        "customer_emotion_end": "unknown",
+        "agent_performance_rating": 5,
+        "strengths": ["Analysis failed"],
+        "improvements": ["Retry analysis"],
+        "key_moments": [],
+        "call_tags": ["analysis_error"]
+    }
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def update_overall_stats(analysis_result: Dict, call_duration: float):
+    """Update overall statistics with new call data"""
+    stats = call_data_store['overall_stats']
+    
+    stats['total_calls'] += 1
+    stats['total_call_duration'] += call_duration
+    stats['average_call_duration'] = stats['total_call_duration'] / stats['total_calls']
+    
+    # Update success/failure counts
+    call_outcome = analysis_result.get('call_outcome', 'unknown')
+    if call_outcome == 'success':
+        stats['successful_calls'] += 1
+    elif call_outcome == 'failure':
+        stats['failed_calls'] += 1
+    
+    # Update sentiment counts
+    sentiment = analysis_result.get('interaction_sentiment', 'neutral')
+    if sentiment == 'positive':
+        stats['positive_interactions'] += 1
+    elif sentiment == 'negative':
+        stats['negative_interactions'] += 1
+    else:
+        stats['neutral_interactions'] += 1
+    
+    # Update KPI averages
+    kpi_fields = [
+        "call_success_rate", "first_call_resolution", "issue_identification", "solution_effectiveness",
+        "customer_satisfaction", "user_interaction_sentiment", "customer_effort_score", "wait_time_satisfaction",
+        "communication_clarity", "listening_skills", "empathy_emotional_intelligence", "product_service_knowledge",
+        "call_control_flow", "information_gathering", "follow_up_commitment", "compliance_adherence",
+        "call_handling_efficiency", "professionalism_courtesy"
+    ]
+    
+    for kpi in kpi_fields:
+        if kpi in analysis_result:
+            current_avg = stats['kpi_averages'].get(kpi, 0)
+            new_avg = ((current_avg * (stats['total_calls'] - 1)) + analysis_result[kpi]) / stats['total_calls']
+            stats['kpi_averages'][kpi] = round(new_avg, 2)
+
+def update_daily_stats(date_str: str, analysis_result: Dict):
+    """Update daily statistics"""
+    if date_str not in call_data_store['daily_stats']:
+        call_data_store['daily_stats'][date_str] = {
+            'total_calls': 0,
+            'successful_calls': 0,
+            'failed_calls': 0,
+            'positive_sentiment': 0,
+            'negative_sentiment': 0,
+            'neutral_sentiment': 0,
+            'average_score': 0.0
+        }
+    
+    daily = call_data_store['daily_stats'][date_str]
+    daily['total_calls'] += 1
+    
+    # Update daily outcome counts
+    if analysis_result.get('call_outcome') == 'success':
+        daily['successful_calls'] += 1
+    elif analysis_result.get('call_outcome') == 'failure':
+        daily['failed_calls'] += 1
+    
+    # Update daily sentiment counts
+    sentiment = analysis_result.get('interaction_sentiment', 'neutral')
+    if sentiment == 'positive':
+        daily['positive_sentiment'] += 1
+    elif sentiment == 'negative':
+        daily['negative_sentiment'] += 1
+    else:
+        daily['neutral_sentiment'] += 1
+    
+    # Update daily average score
+    current_avg = daily['average_score']
+    overall_score = analysis_result.get('overall_score', 5.0)
+    daily['average_score'] = ((current_avg * (daily['total_calls'] - 1)) + overall_score) / daily['total_calls']
 
 # --- Flask Routes ---
 @app.route('/')
 def dashboard():
-    return render_template('dashboard.html')
+    return render_template('call_analysis_dashboard.html')
 
 @app.route('/health')
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'twilio_polling_active': call_monitor.polling_thread and call_monitor.polling_thread.is_alive(),
-        'active_calls_count': len(live_data['active_calls']),
+        'total_calls_analyzed': call_data_store['overall_stats']['total_calls'],
         'timestamp': datetime.now().isoformat()
     })
 
-@app.route('/api/stats')
-def get_stats():
-    return jsonify({
-        'total_calls': live_data['call_stats']['total_calls'],
-        'in_progress': live_data['call_stats']['in_progress'],
-        'completed': live_data['call_stats']['completed'],
-        'analyzed_segments': live_data['call_stats']['analyzed_segments'],
-        'average_quality_score': round(live_data['call_stats']['average_quality_score'], 1) if live_data['call_stats']['analyzed_segments'] > 0 else 0.0,
-        'agents_count': len(set(call['to_number'] for call in live_data['active_calls'].values()))
-    })
-
-@app.route('/test-twilio', methods=['GET'])
-def test_twilio():
+# --- ElevenLabs Webhook Endpoint ---
+@app.route('/webhook/elevenlabs/transcript', methods=['POST'])
+def elevenlabs_transcript_webhook():
+    """Receive post-call transcript from ElevenLabs"""
     try:
-        account = twilio_client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
-        recent_calls = twilio_client.calls.list(limit=5)
-        call_info = [{
-            'sid': call.sid, 'from': call.from_, 'to': call.to,
-            'status': call.status, 'start_time': str(call.start_time), 'direction': call.direction
-        } for call in recent_calls]
-        return jsonify({
-            'status': 'success', 'account_name': account.friendly_name,
-            'monitored_numbers': MONITOR_PHONE_NUMBERS, 'recent_calls': call_info
-        })
-    except Exception as e:
-        print(f"❌ Twilio connection failed: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/simulate-call', methods=['POST'])
-def simulate_call():
-    try:
-        fake_call_sid = f"fake_call_{int(time.time())}"
-        fake_from = "+15551234567"
-        fake_to = MONITOR_PHONE_NUMBERS[0] if MONITOR_PHONE_NUMBERS else "+15559876543"
-
-        live_data['active_calls'][fake_call_sid] = {
-            'number': fake_from,
-            'to_number': fake_to,
-            'start_time': datetime.now(),
-            'duration': '00:00',
-            'status': 'in-progress',
-            'transcripts': [],
-            'analysis': [],
-            'elevenlabs_agent_stream': None
+        data = request.get_json()
+        
+        # Extract data from ElevenLabs webhook
+        call_id = data.get('conversation_id') or data.get('call_id') or str(uuid.uuid4())
+        transcript = data.get('transcript') or data.get('full_transcript', '')
+        agent_id = data.get('agent_id', 'unknown')
+        duration = data.get('duration_seconds', 0)
+        call_type = data.get('call_type', 'unknown')
+        
+        print(f"📞 Received ElevenLabs transcript for call: {call_id}")
+        
+        if not transcript:
+            return jsonify({'error': 'No transcript provided'}), 400
+        
+        # Prepare metadata
+        call_metadata = {
+            'duration': duration,
+            'agent_id': agent_id,
+            'call_type': call_type,
+            'source': 'elevenlabs'
         }
-        live_data['call_stats']['total_calls'] += 1
-        live_data['call_stats']['in_progress'] += 1
-
-        print(f"🎭 SIMULATED CALL: {fake_call_sid} from {fake_from} to {fake_to}")
-
-        socketio.emit('call_started', {
-            'call_sid': fake_call_sid,
-            'number': fake_from,
-            'to_number': fake_to,
-            'start_time': live_data['active_calls'][fake_call_sid]['start_time'].strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Analyze the transcript
+        analysis_result = analyze_call_transcript(transcript, call_metadata)
+        
+        # Store call data
+        call_record = {
+            'call_id': call_id,
+            'transcript': transcript,
+            'analysis': analysis_result,
+            'metadata': call_metadata,
+            'timestamp': datetime.now().isoformat(),
+            'duration': duration,
+            'source': 'elevenlabs'
+        }
+        
+        call_data_store['completed_calls'][call_id] = call_record
+        update_overall_stats(analysis_result, duration)
+        update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
+        
+        # Emit real-time update to dashboard
+        socketio.emit('new_call_analysis', {
+            'call_id': call_id,
+            'analysis': analysis_result,
+            'duration': duration,
+            'agent_id': agent_id,
+            'timestamp': datetime.now().strftime("%H:%M:%S")
         })
-
-        def generate_fake_transcript_and_analysis():
-            time.sleep(3)
-            fake_segments = [
-                "Hello, thank you for calling. How may I assist you today?",
-                "I understand you're having an issue with your internet connection. Let me check that for you.",
-                "Yes, I can confirm that. We'll need to reset your router. Can you do that for me now?",
-                "Excellent. Please wait a moment while it reboots.",
-                "Great! Is there anything else I can help you with today?"
-            ]
-            for i, segment in enumerate(fake_segments):
-                if fake_call_sid not in live_data['active_calls']:
-                    break
-
-                call_data = live_data['active_calls'].get(fake_call_sid)
-                if call_data:
-                    call_data['transcripts'].append(segment)
-                    analysis_result = analyze_agent_response(segment, call_data['transcripts'])
-                    call_data['analysis'].append(analysis_result)
-                    live_data['call_stats']['analyzed_segments'] += 1
-
-                    if analysis_result and analysis_result.get('overall_score') is not None:
-                        if live_data['call_stats']['analyzed_segments'] > 0:
-                            current_total = live_data['call_stats']['average_quality_score'] * (live_data['call_stats']['analyzed_segments'] - 1)
-                            live_data['call_stats']['average_quality_score'] = \
-                                (current_total + analysis_result['overall_score']) / live_data['call_stats']['analyzed_segments']
-                        else:
-                            live_data['call_stats']['average_quality_score'] = analysis_result['overall_score']
-
-
-                    socketio.emit('live_analysis', {
-                        'call_sid': fake_call_sid,
-                        'transcript_chunk': segment,
-                        'analysis_result': analysis_result,
-                        'timestamp': datetime.now().strftime("%H:%M:%S")
-                    })
-                time.sleep(5)
-
-            time.sleep(5)
-            if fake_call_sid in live_data['active_calls']:
-                call_monitor.handle_call_end(fake_call_sid)
-
-        threading.Thread(target=generate_fake_transcript_and_analysis, daemon=True).start()
-
-        return jsonify({'status': 'success', 'call_sid': fake_call_sid})
-
+        
+        print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+        
+        return jsonify({
+            'status': 'success',
+            'call_id': call_id,
+            'analysis_summary': {
+                'outcome': analysis_result.get('call_outcome'),
+                'sentiment': analysis_result.get('interaction_sentiment'),
+                'overall_score': analysis_result.get('overall_score')
+            }
+        })
+        
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/webhook/call-start', methods=['POST'])
-def twilio_call_start():
-    from twilio.twiml.voice_response import VoiceResponse
-
-    call_sid = request.form.get('CallSid')
-    from_number = request.form.get('From')
-    to_number = request.form.get('To')
-
-    print(f"🔔 Twilio webhook: Call {call_sid} from {from_number} to {to_number}")
-
-    call_obj = twilio_client.calls(call_sid).fetch()
-    call_monitor.handle_new_call(call_obj)
-
-    response = VoiceResponse()
-    stream_url = f'wss://{request.host}/audio-stream/{call_sid}'
-    response.start().stream(
-        url=stream_url,
-        track='both_tracks'
-    )
-    response.dial(to_number)
-
-    return str(response)
-
-@app.route('/webhook/call-end', methods=['POST'])
-def twilio_call_end():
-    call_sid = request.form.get('CallSid')
-    print(f"🔚 Call ended webhook received for: {call_sid}")
-    call_monitor.handle_call_end(call_sid)
-    return '', 200
-
-# --- Flask-SocketIO Event Handlers for Twilio Media Stream ---
-@socketio.on('connect', namespace='/audio-stream')
-def handle_audio_stream_connect():
-    print(f"🎧 Twilio Media Stream WebSocket connected.")
-
-@socketio.on('message', namespace='/audio-stream')
-def handle_media_stream_message(message):
-    try:
-        payload = message
-
-        event_type = payload.get('event')
-        call_sid = payload.get('call_sid')
-
-        if event_type == 'start':
-            print(f"Twilio Media Stream 'start' event for CallSid: {call_sid}")
-            if call_sid not in live_data['active_calls']:
-                call_obj = twilio_client.calls(call_sid).fetch()
-                call_monitor.handle_new_call(call_obj)
-        elif event_type == 'media':
-            audio_payload = payload['media']['payload']
-
-            if call_sid and call_sid in live_data['active_calls']:
-                call_data = live_data['active_calls'][call_sid]
-                elevenlabs_stream = call_data.get('elevenlabs_agent_stream')
-
-                if elevenlabs_stream:
-                    audio_data_mulaw = base64.b64decode(audio_payload)
-                    pcm_audio = audioop.ulaw2lin(audio_data_mulaw, 2)
-
-                    elevenlabs_stream.send_audio(pcm_audio)
-                else:
-                    print(f"No ElevenLabs Agent Stream found for Call SID {call_sid}. Audio dropped.")
-            else:
-                print(f"Media received for unknown or ended Call SID: {call_sid}. Audio dropped.")
-
-        elif event_type == 'stop':
-            print(f"Twilio Media Stream 'stop' event for CallSid: {call_sid}")
-            call_monitor.handle_call_end(call_sid)
-
-    except Exception as e:
-        print(f"❌ Error handling Twilio Media Stream message: {e}")
+        print(f"❌ Error processing ElevenLabs webhook: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
-@socketio.on('disconnect', namespace='/audio-stream')
-def handle_audio_stream_disconnect():
-    print("🎧 Twilio Media Stream WebSocket disconnected.")
+# --- Xelion Webhook Endpoint ---
+@app.route('/webhook/xelion/audio', methods=['POST'])
+def xelion_audio_webhook():
+    """Receive audio file and/or transcript from Xelion"""
+    try:
+        # Handle file upload
+        if 'audio_file' in request.files:
+            file = request.files['audio_file']
+            if file.filename != '' and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_filename = f"{timestamp}_{filename}"
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+                file.save(filepath)
+                
+                # Get metadata from form data
+                call_id = request.form.get('call_id', str(uuid.uuid4()))
+                duration = float(request.form.get('duration', 0))
+                agent_id = request.form.get('agent_id', 'unknown')
+                transcript = request.form.get('transcript', '')
+                
+                print(f"📞 Received Xelion audio for call: {call_id}")
+                
+                # If transcript provided, analyze it
+                analysis_result = None
+                if transcript:
+                    call_metadata = {
+                        'duration': duration,
+                        'agent_id': agent_id,
+                        'call_type': 'voice',
+                        'source': 'xelion',
+                        'audio_file': unique_filename
+                    }
+                    analysis_result = analyze_call_transcript(transcript, call_metadata)
+                    
+                    # Store call data
+                    call_record = {
+                        'call_id': call_id,
+                        'transcript': transcript,
+                        'analysis': analysis_result,
+                        'metadata': call_metadata,
+                        'timestamp': datetime.now().isoformat(),
+                        'duration': duration,
+                        'source': 'xelion',
+                        'audio_file': unique_filename
+                    }
+                    
+                    call_data_store['completed_calls'][call_id] = call_record
+                    update_overall_stats(analysis_result, duration)
+                    update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
+                    
+                    # Emit real-time update
+                    socketio.emit('new_call_analysis', {
+                        'call_id': call_id,
+                        'analysis': analysis_result,
+                        'duration': duration,
+                        'agent_id': agent_id,
+                        'timestamp': datetime.now().strftime("%H:%M:%S"),
+                        'has_audio': True
+                    })
+                
+                return jsonify({
+                    'status': 'success',
+                    'call_id': call_id,
+                    'audio_file': unique_filename,
+                    'analysis_summary': {
+                        'outcome': analysis_result.get('call_outcome') if analysis_result else 'pending',
+                        'sentiment': analysis_result.get('interaction_sentiment') if analysis_result else 'unknown',
+                        'overall_score': analysis_result.get('overall_score') if analysis_result else 0
+                    } if analysis_result else None
+                })
+        
+        # Handle JSON data without file
+        data = request.get_json()
+        if data:
+            call_id = data.get('call_id', str(uuid.uuid4()))
+            transcript = data.get('transcript', '')
+            duration = data.get('duration', 0)
+            agent_id = data.get('agent_id', 'unknown')
+            
+            if transcript:
+                call_metadata = {
+                    'duration': duration,
+                    'agent_id': agent_id,
+                    'call_type': 'voice',
+                    'source': 'xelion'
+                }
+                
+                analysis_result = analyze_call_transcript(transcript, call_metadata)
+                
+                call_record = {
+                    'call_id': call_id,
+                    'transcript': transcript,
+                    'analysis': analysis_result,
+                    'metadata': call_metadata,
+                    'timestamp': datetime.now().isoformat(),
+                    'duration': duration,
+                    'source': 'xelion'
+                }
+                
+                call_data_store['completed_calls'][call_id] = call_record
+                update_overall_stats(analysis_result, duration)
+                update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
+                
+                socketio.emit('new_call_analysis', {
+                    'call_id': call_id,
+                    'analysis': analysis_result,
+                    'duration': duration,
+                    'agent_id': agent_id,
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                })
+                
+                return jsonify({
+                    'status': 'success',
+                    'call_id': call_id,
+                    'analysis_summary': {
+                        'outcome': analysis_result.get('call_outcome'),
+                        'sentiment': analysis_result.get('interaction_sentiment'),
+                        'overall_score': analysis_result.get('overall_score')
+                    }
+                })
+        
+        return jsonify({'error': 'No valid data received'}), 400
+        
+    except Exception as e:
+        print(f"❌ Error processing Xelion webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
+# --- API Endpoints ---
+@app.route('/api/stats')
+def get_stats():
+    stats = call_data_store['overall_stats']
+    return jsonify({
+        'total_calls': stats['total_calls'],
+        'successful_calls': stats['successful_calls'],
+        'failed_calls': stats['failed_calls'],
+        'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+        'positive_interactions': stats['positive_interactions'],
+        'negative_interactions': stats['negative_interactions'],
+        'neutral_interactions': stats['neutral_interactions'],
+        'positive_rate': round((stats['positive_interactions'] / max(stats['total_calls'], 1)) * 100, 1),
+        'negative_rate': round((stats['negative_interactions'] / max(stats['total_calls'], 1)) * 100, 1),
+        'average_call_duration': round(stats['average_call_duration'], 1),
+        'kpi_averages': stats['kpi_averages']
+    })
 
-# --- Flask-SocketIO Event Handlers for Dashboard Frontend ---
+@app.route('/api/calls')
+def get_recent_calls():
+    limit = int(request.args.get('limit', 50))
+    calls = list(call_data_store['completed_calls'].values())
+    recent_calls = sorted(calls, key=lambda x: x['timestamp'], reverse=True)[:limit]
+    
+    return jsonify({
+        'calls': recent_calls,
+        'total_count': len(calls)
+    })
+
+@app.route('/api/calls/<call_id>')
+def get_call_details(call_id):
+    call = call_data_store['completed_calls'].get(call_id)
+    if not call:
+        return jsonify({'error': 'Call not found'}), 404
+    return jsonify(call)
+
+@app.route('/api/daily-stats')
+def get_daily_stats():
+    days = int(request.args.get('days', 7))
+    daily_data = []
+    
+    for i in range(days):
+        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+        stats = call_data_store['daily_stats'].get(date, {
+            'total_calls': 0,
+            'successful_calls': 0,
+            'failed_calls': 0,
+            'positive_sentiment': 0,
+            'negative_sentiment': 0,
+            'neutral_sentiment': 0,
+            'average_score': 0.0
+        })
+        stats['date'] = date
+        daily_data.append(stats)
+    
+    return jsonify(daily_data[::-1])  # Reverse to get chronological order
+
+@app.route('/api/kpi-trends')
+def get_kpi_trends():
+    """Get KPI trends over time"""
+    # This would typically come from a time-series database
+    # For now, return current averages as example
+    return jsonify({
+        'current_kpis': call_data_store['overall_stats']['kpi_averages'],
+        'trend_data': []  # Would contain historical KPI data points
+    })
+
+# --- Flask-SocketIO Event Handlers ---
 @socketio.on('connect')
 def handle_dashboard_connect():
     print("🌐 Dashboard client connected via WebSocket.")
-    emit('connected', {'status': 'Connected to live call monitoring system!'})
-    handle_get_live_data()
+    emit('connected', {'status': 'Connected to post-call analysis system!'})
+    handle_get_dashboard_data()
 
-@socketio.on('get_live_data')
-def handle_get_live_data():
-    active_calls_data = []
-
-    for call_sid, call_info in live_data['active_calls'].items():
-        active_calls_data.append({
-            'call_sid': call_sid,
-            'from': call_info['number'],
-            'to': call_info['to_number'],
-            'duration': call_info['duration'],
-            'status': call_info['status'],
-            'latest_transcript': call_info['transcripts'][-1] if call_info['transcripts'] else '',
-            'latest_analysis': call_info['analysis'][-1] if call_info['analysis'] else {},
-            'overall_score': call_info['analysis'][-1].get('overall_score', 0) if call_info['analysis'] else 0
-        })
-
-    emit('live_data_update', {
-        'active_calls': active_calls_data,
-        'total_calls': live_data['call_stats']['total_calls'],
-        'in_progress_calls': live_data['call_stats']['in_progress'],
-        'completed_calls': live_data['call_stats']['completed'],
-        'average_overall_quality': round(live_data['call_stats']['average_quality_score'], 1)
+@socketio.on('get_dashboard_data')
+def handle_get_dashboard_data():
+    recent_calls = list(call_data_store['completed_calls'].values())[-10:]  # Last 10 calls
+    recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+    
+    stats = call_data_store['overall_stats']
+    
+    emit('dashboard_data_update', {
+        'recent_calls': recent_calls,
+        'total_calls': stats['total_calls'],
+        'successful_calls': stats['successful_calls'],
+        'failed_calls': stats['failed_calls'],
+        'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+        'positive_interactions': stats['positive_interactions'],
+        'negative_interactions': stats['negative_interactions'],
+        'positive_rate': round((stats['positive_interactions'] / max(stats['total_calls'], 1)) * 100, 1),
+        'average_call_duration': round(stats['average_call_duration'], 1),
+        'kpi_averages': stats['kpi_averages']
     })
-
 
 # --- Application Entry Point ---
 if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("🎧 Live Call Quality Monitoring System with ElevenLabs Conversational AI")
-    print("📊 Quality Factors: Politeness, Objection Handling, Knowledge, Customer Happiness")
-    print("🔧 Using Environment Variables for API Keys")
-    print(f"📞 Monitoring Phone Numbers: {', '.join(MONITOR_PHONE_NUMBERS)}")
+    print("\n" + "="*60)
+    print("📊 Post-Call Analysis Dashboard")
+    print("📈 Real-time Call Quality Analytics with 18 KPIs")
+    print("🔗 Webhook Endpoints:")
+    print("  - ElevenLabs: POST /webhook/elevenlabs/transcript")
+    print("  - Xelion: POST /webhook/xelion/audio")
     print("🌐 Dashboard: http://localhost:5000")
-    print("🧪 Test Twilio: http://localhost:5000/test-twilio")
-    print("🎭 Simulate Call: Click 'Simulate Call' button on dashboard (simulates analysis, not ElevenLabs agent)")
-    print("▶️  Starting Twilio call polling automatically...")
-    print("="*50 + "\n")
+    print("🔍 Health Check: http://localhost:5000/health")
+    print("📊 API Stats: http://localhost:5000/api/stats")
+    print("="*60 + "\n")
 
-    call_monitor.start_polling()
-
-    # Using allow_unsafe_werkzeug for development. Remove or set to False in production.
-    socketio.run(app, debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)), allow_unsafe_werkzeug=True)
-
-# Gunicorn entry point (used by Koyeb)
-# WARNING: This setup will only work correctly with a SINGLE Gunicorn worker.
-# If Gunicorn is configured with multiple workers (default for some platforms),
-# real-time updates and inter-call communication via WebSockets will be unreliable.
-# For multi-worker setups, a message queue like Redis IS REQUIRED for Flask-SocketIO.
+    socketio.run(app, debug=False, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
