@@ -52,13 +52,18 @@ if not MONITOR_PHONE_NUMBERS:
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 openai.api_key = OPENAI_API_KEY
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
+app.config['REDIS_URL'] = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 # Use 'threading' async_mode for simplicity when integrating with a separate asyncio thread
 # For pure async (eventlet/gevent), you'd need to adapt the ElevenLabsAgentStream more carefully.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading', # Keep this as you're using threads
+    message_queue=REDIS_URL # <--- ADD THIS LINE
+)
 
 # --- Global Data Stores (In-memory for simplicity, consider Redis for production) ---
 live_data = {
