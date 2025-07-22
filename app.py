@@ -324,6 +324,15 @@ def update_daily_stats(date_str: str, analysis_result: Dict):
 def dashboard():
     return render_template('dashboard.html')
 
+@app.route('/debug/calls')
+def debug_calls():
+    """Debug endpoint to see all stored calls"""
+    return jsonify({
+        'completed_calls': call_data_store['completed_calls'],
+        'overall_stats': call_data_store['overall_stats'],
+        'total_stored': len(call_data_store['completed_calls'])
+    })
+
 @app.route('/health')
 def health_check():
     return jsonify({
@@ -691,6 +700,8 @@ def handle_get_dashboard_data():
     
     stats = call_data_store['overall_stats']
     
+    print(f"📊 Sending dashboard data: {len(recent_calls)} calls, {stats['total_calls']} total")
+    
     emit('dashboard_data_update', {
         'recent_calls': recent_calls,
         'total_calls': stats['total_calls'],
@@ -699,6 +710,7 @@ def handle_get_dashboard_data():
         'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
         'positive_interactions': stats['positive_interactions'],
         'negative_interactions': stats['negative_interactions'],
+        'neutral_interactions': stats['neutral_interactions'],
         'positive_rate': round((stats['positive_interactions'] / max(stats['total_calls'], 1)) * 100, 1),
         'average_call_duration': round(stats['average_call_duration'], 1),
         'kpi_averages': stats['kpi_averages']
