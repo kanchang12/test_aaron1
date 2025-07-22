@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 from werkzeug.utils import secure_filename
 
 # Load environment variables
@@ -35,8 +35,8 @@ if not all([OPENAI_API_KEY, ELEVENLABS_API_KEY, SECRET_KEY]):
 # Create upload directory
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- Initialize Clients ---
-openai.api_key = OPENAI_API_KEY
+# --- Initialize OpenAI Client ---
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -66,6 +66,30 @@ call_data_store = {
         'kpi_averages': {}
     }
 }
+
+# --- Audio Transcription Function ---
+def transcribe_audio(audio_file_path: str) -> str:
+    """
+    Transcribe audio file using OpenAI Whisper
+    """
+    try:
+        print(f"🎵 Starting transcription for: {audio_file_path}")
+        
+        with open(audio_file_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+        
+        print(f"✅ Transcription completed. Length: {len(transcript)} characters")
+        return transcript
+        
+    except Exception as e:
+        print(f"❌ Transcription error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
 
 # --- Enhanced KPI Analysis Function ---
 def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
@@ -154,7 +178,7 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
         }}
         """
 
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
@@ -298,7 +322,7 @@ def update_daily_stats(date_str: str, analysis_result: Dict):
 # --- Flask Routes ---
 @app.route('/')
 def dashboard():
-    return render_template('call_analysis_dashboard.html')
+    return render_template('dashboard.html')
 
 @app.route('/health')
 def health_check():
@@ -390,32 +414,51 @@ def xelion_audio_webhook():
         
         # Check if this is a multipart form upload (file upload)
         if request.content_type and request.content_type.startswith('multipart/form-data'):
-            print(f"📞 Form data: {dict(request.form)}")
+            print(f"📞 Form data keys: {list(request.form.keys())}")
             print(f"📞 Files: {list(request.files.keys())}")
             
             # Handle multipart form data (audio file upload)
             call_id = request.form.get('call_id', str(uuid.uuid4()))
             duration = float(request.form.get('duration', 0))
             agent_id = request.form.get('agent_id', 'unknown')
-            transcript = request.form.get('transcript', '')
+            provided_transcript = request.form.get('transcript', '')
             
             print(f"📞 Processing multipart form data for call: {call_id}")
             
             # Handle audio file if present
             unique_filename = None
+            audio_file_path = None
             if 'audio_file' in request.files:
                 file = request.files['audio_file']
                 if file.filename != '' and allowed_file(file.filename):
                     filename = secure_filename(file.filename)
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     unique_filename = f"{timestamp}_{filename}"
-                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-                    file.save(filepath)
+                    audio_file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+                    file.save(audio_file_path)
                     print(f"📞 Audio file saved: {unique_filename}")
                 else:
                     print(f"❌ Invalid audio file: {file.filename}")
             
-            # Process transcript if provided
+            # Determine transcript source
+            transcript = provided_transcript
+            transcript_source = "provided"
+            
+            # If no transcript provided but audio file exists, transcribe it
+            if (not transcript or transcript.strip() == "") and audio_file_path:
+                print(f"🎵 No transcript provided, transcribing audio file: {unique_filename}")
+                transcript = transcribe_audio(audio_file_path)
+                transcript_source = "whisper_transcribed"
+                
+                if not transcript:
+                    return jsonify({
+                        'status': 'error',
+                        'call_id': call_id,
+                        'audio_file': unique_filename,
+                        'error': 'Audio transcription failed'
+                    }), 400
+            
+            # Process transcript if available
             analysis_result = None
             if transcript and transcript.strip():
                 call_metadata = {
@@ -423,10 +466,11 @@ def xelion_audio_webhook():
                     'agent_id': agent_id,
                     'call_type': 'voice',
                     'source': 'xelion',
-                    'audio_file': unique_filename
+                    'audio_file': unique_filename,
+                    'transcript_source': transcript_source
                 }
                 
-                print(f"📞 Analyzing transcript for call: {call_id}")
+                print(f"📞 Analyzing transcript for call: {call_id} (source: {transcript_source})")
                 analysis_result = analyze_call_transcript(transcript, call_metadata)
                 
                 # Store call data
@@ -438,7 +482,8 @@ def xelion_audio_webhook():
                     'timestamp': datetime.now().isoformat(),
                     'duration': duration,
                     'source': 'xelion',
-                    'audio_file': unique_filename
+                    'audio_file': unique_filename,
+                    'transcript_source': transcript_source
                 }
                 
                 call_data_store['completed_calls'][call_id] = call_record
@@ -452,20 +497,23 @@ def xelion_audio_webhook():
                     'duration': duration,
                     'agent_id': agent_id,
                     'timestamp': datetime.now().strftime("%H:%M:%S"),
-                    'has_audio': unique_filename is not None
+                    'has_audio': unique_filename is not None,
+                    'transcript_source': transcript_source
                 })
                 
                 print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
             else:
-                print(f"📞 No transcript provided for call: {call_id}, only storing audio file")
+                print(f"📞 No transcript available for call: {call_id}")
             
             return jsonify({
                 'status': 'success',
                 'call_id': call_id,
                 'audio_file': unique_filename,
-                'transcript_provided': bool(transcript and transcript.strip()),
+                'transcript_provided': bool(provided_transcript and provided_transcript.strip()),
+                'transcript_transcribed': transcript_source == "whisper_transcribed",
                 'analysis_completed': analysis_result is not None,
-                'message': 'Audio file uploaded successfully' + (' and transcript analyzed' if analysis_result else ' - provide transcript for analysis'),
+                'message': f'Audio file uploaded successfully' + 
+                          (f' and transcript {transcript_source}' if transcript else ' - no transcript available'),
                 'analysis_summary': {
                     'outcome': analysis_result.get('call_outcome') if analysis_result else 'pending',
                     'sentiment': analysis_result.get('interaction_sentiment') if analysis_result else 'unknown',
@@ -492,7 +540,8 @@ def xelion_audio_webhook():
                         'duration': duration,
                         'agent_id': agent_id,
                         'call_type': 'voice',
-                        'source': 'xelion'
+                        'source': 'xelion',
+                        'transcript_source': 'provided'
                     }
                     
                     analysis_result = analyze_call_transcript(transcript, call_metadata)
@@ -504,7 +553,8 @@ def xelion_audio_webhook():
                         'metadata': call_metadata,
                         'timestamp': datetime.now().isoformat(),
                         'duration': duration,
-                        'source': 'xelion'
+                        'source': 'xelion',
+                        'transcript_source': 'provided'
                     }
                     
                     call_data_store['completed_calls'][call_id] = call_record
@@ -516,7 +566,8 @@ def xelion_audio_webhook():
                         'analysis': analysis_result,
                         'duration': duration,
                         'agent_id': agent_id,
-                        'timestamp': datetime.now().strftime("%H:%M:%S")
+                        'timestamp': datetime.now().strftime("%H:%M:%S"),
+                        'transcript_source': 'provided'
                     })
                     
                     print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
@@ -656,8 +707,9 @@ def handle_get_dashboard_data():
 # --- Application Entry Point ---
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("📊 Post-Call Analysis Dashboard")
+    print("📊 Post-Call Analysis Dashboard with Whisper Transcription")
     print("📈 Real-time Call Quality Analytics with 18 KPIs")
+    print("🎵 Automatic audio transcription using OpenAI Whisper")
     print("🔗 Webhook Endpoints:")
     print("  - ElevenLabs: POST /webhook/elevenlabs/transcript")
     print("  - Xelion: POST /webhook/xelion/audio")
