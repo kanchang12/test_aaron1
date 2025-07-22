@@ -1,5 +1,10 @@
-Flask
-tavily-python
+flask
+flask-socketio
 openai
+twilio
+requests
 python-dotenv
 gunicorn
+eventlet
+python-socketio
+python-engineio
