@@ -481,7 +481,7 @@ def simulate_call():
 @app.route('/webhook/call-start', methods=['POST'])
 def twilio_call_start():
     """Twilio webhook when call starts"""
-    from twilio.twiml import VoiceResponse
+    from twilio.twiml.voice_response import VoiceResponse
     
     call_sid = request.form.get('CallSid')
     from_number = request.form.get('From')
