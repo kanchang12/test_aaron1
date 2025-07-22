@@ -21,7 +21,7 @@ import aiohttp # For async HTTP client in websockets
 # Import the ElevenLabs Client
 from elevenlabs.client import ElevenLabs
 from elevenlabs import Voice, VoiceSettings, play
-
+app = Flask(__name__)
 # Load environment variables from .env file
 load_dotenv()
 
