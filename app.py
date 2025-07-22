@@ -103,7 +103,7 @@ class ElevenLabsAgentStream:
         print(f"ElevenLabsAgentStream initialized for Call SID: {self.call_sid}")
 
     async def _connect(self):
-        ws_url = "wss://api.elevenlabs.io/v1/convai/conversation"
+        ws_url = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={self.elevenlabs_agent_id}"
         headers = {
             "xi-api-key": self.elevenlabs_api_key,
             "Content-Type": "application/json" # This header is good for the initial payload
