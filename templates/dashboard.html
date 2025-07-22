@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Post-Call Analysis Dashboard</title>
+    <!-- Save this file as templates/dashboard.html -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>
@@ -657,15 +658,21 @@
             loadRecentCalls();
             loadStats();
             updateKPIDisplay(data.analysis);
+            
+            // Show notification
+            console.log('🎉 New analysis received for call:', data.call_id);
         });
 
         function updateDashboardStats(data) {
+            console.log('📊 Updating dashboard with data:', data);
+            
             document.getElementById('total-calls').textContent = data.total_calls || 0;
             document.getElementById('successful-calls').textContent = data.successful_calls || 0;
             document.getElementById('failed-calls').textContent = data.failed_calls || 0;
             document.getElementById('success-rate').textContent = (data.success_rate || 0) + '%';
             document.getElementById('positive-interactions').textContent = data.positive_interactions || 0;
             document.getElementById('negative-interactions').textContent = data.negative_interactions || 0;
+            document.getElementById('neutral-interactions').textContent = data.neutral_interactions || 0;
             document.getElementById('avg-duration').textContent = (data.average_call_duration || 0) + 's';
 
             // Update KPIs
@@ -750,6 +757,7 @@
         }
 
         function updateRecentCallsList(calls) {
+            console.log('📞 Updating recent calls list with', calls.length, 'calls');
             const container = document.getElementById('recent-calls-list');
             
             if (calls.length === 0) {
@@ -758,6 +766,7 @@
             }
 
             container.innerHTML = calls.map(call => {
+                console.log('📞 Processing call:', call.call_id, call.source);
                 const analysis = call.analysis || {};
                 const metadata = call.metadata || {};
                 
