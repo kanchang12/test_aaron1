@@ -98,53 +98,17 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
     """
     try:
         prompt = f"""
-        Analyze this complete call transcript for comprehensive quality metrics and determine call success/failure.
+        Analyze this call transcript and provide analysis as valid JSON only.
         
-        Call Metadata:
+        Call Details:
         - Duration: {call_metadata.get('duration', 'unknown')} seconds
-        - Agent ID: {call_metadata.get('agent_id', 'unknown')}
-        - Call Type: {call_metadata.get('call_type', 'unknown')}
+        - Agent: {call_metadata.get('agent_id', 'unknown')}
         - Source: {call_metadata.get('source', 'unknown')}
         
         Transcript: "{transcript}"
 
-        Provide analysis on these 18 KPIs (rate 1-10, where 1=poor, 10=excellent):
+        Rate each KPI from 1-10 and determine call success. Respond with ONLY this JSON structure:
 
-        **Call Success & Resolution KPIs:**
-        1. call_success_rate - Was the customer's primary issue/request resolved successfully?
-        2. first_call_resolution - Was the issue resolved without requiring callbacks or escalation?
-        3. issue_identification - How well did the agent identify and understand the customer's problem?
-        4. solution_effectiveness - How effective was the solution provided to the customer?
-
-        **Customer Experience & Sentiment KPIs:**
-        5. customer_satisfaction - Overall customer happiness and satisfaction level
-        6. user_interaction_sentiment - Customer's emotional journey (frustrated->satisfied, etc.)
-        7. customer_effort_score - How easy was it for the customer to get their issue resolved?
-        8. wait_time_satisfaction - Customer satisfaction with response times and call flow
-
-        **Agent Performance KPIs:**
-        9. communication_clarity - How clearly and understandably did the agent communicate?
-        10. listening_skills - How well did the agent listen and understand customer needs?
-        11. empathy_emotional_intelligence - Agent's empathy and emotional connection with customer
-        12. product_service_knowledge - Agent's knowledge of products, services, and company policies
-        13. call_control_flow - Agent's ability to guide and manage the conversation effectively
-        14. professionalism_courtesy - Professional demeanor, politeness, and appropriate language use
-
-        **Operational Efficiency KPIs:**
-        15. call_handling_efficiency - Appropriate call length relative to issue complexity
-        16. information_gathering - How effectively did the agent gather necessary customer information?
-        17. follow_up_commitment - Clear next steps, commitments, and follow-up arrangements
-        18. compliance_adherence - Following company scripts, policies, and regulatory requirements
-
-        **Overall Assessment:**
-        - call_outcome: "success" | "failure" | "partial_success"
-        - interaction_sentiment: "positive" | "negative" | "neutral" | "mixed"
-        - primary_reason: Brief specific reason for the outcome (max 50 characters)
-        - customer_emotion_start: Customer's initial emotional state
-        - customer_emotion_end: Customer's final emotional state
-        - agent_performance_rating: Overall agent performance (1-10)
-
-        Return ONLY valid JSON in this exact format:
         {{
             "call_success_rate": 8,
             "first_call_resolution": 7,
@@ -167,14 +131,14 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
             "overall_score": 7.7,
             "call_outcome": "success",
             "interaction_sentiment": "positive",
-            "primary_reason": "Billing issue resolved efficiently",
+            "primary_reason": "Issue resolved effectively",
             "customer_emotion_start": "frustrated",
             "customer_emotion_end": "satisfied",
             "agent_performance_rating": 8,
-            "strengths": ["clear communication", "good product knowledge", "professional manner"],
-            "improvements": ["could improve follow-up process", "faster information gathering"],
-            "key_moments": ["Customer initially frustrated about bill", "Agent explained charges clearly", "Customer thanked agent at end"],
-            "call_tags": ["billing", "resolved", "positive_outcome"]
+            "strengths": ["clear communication", "empathy", "problem solving"],
+            "improvements": ["faster resolution", "better follow-up"],
+            "key_moments": ["customer complaint", "solution provided", "satisfaction achieved"],
+            "call_tags": ["support", "resolved", "positive"]
         }}
         """
 
@@ -185,7 +149,37 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
             max_tokens=1000
         )
 
-        result = json.loads(response.choices[0].message.content)
+        response_text = response.choices[0].message.content
+        print(f"📊 OpenAI raw response: '{response_text}'")
+        print(f"📊 Response length: {len(response_text) if response_text else 0}")
+        
+        if not response_text or response_text.strip() == "":
+            print("❌ Empty response from OpenAI")
+            return create_default_analysis_result(error="Empty response from OpenAI")
+        
+        response_text = response_text.strip()
+        
+        # Try to extract JSON from response if it's wrapped in other text
+        if "```json" in response_text:
+            print("📊 Found JSON code block, extracting...")
+            json_start = response_text.find("```json") + 7
+            json_end = response_text.find("```", json_start)
+            if json_end != -1:
+                response_text = response_text[json_start:json_end].strip()
+        elif "{" in response_text and "}" in response_text:
+            # Find the JSON object
+            print("📊 Extracting JSON object...")
+            json_start = response_text.find("{")
+            json_end = response_text.rfind("}") + 1
+            response_text = response_text[json_start:json_end]
+        
+        print(f"📊 Cleaned response for parsing: '{response_text[:200]}...'")
+        
+        if not response_text.startswith("{"):
+            print("❌ Response doesn't start with JSON")
+            return create_default_analysis_result(error=f"Invalid JSON format: {response_text[:100]}")
+
+        result = json.loads(response_text)
         
         # Ensure all required KPI fields are present with default values
         required_kpis = [
@@ -207,14 +201,11 @@ def analyze_call_transcript(transcript: str, call_metadata: Dict) -> Dict:
                 
         return result
 
-    except json.JSONDecodeError as e:
-        print(f"❌ OpenAI analysis JSON decode error: {e}")
-        return create_default_analysis_result(error=f"JSON Decode Error: {str(e)}")
     except Exception as e:
-        print(f"❌ OpenAI analysis error: {e}")
+        print(f"❌ Unexpected error in analysis: {e}")
         import traceback
         traceback.print_exc()
-        return create_default_analysis_result(error=f"Analysis Error: {str(e)}")
+        return create_default_analysis_result(error=f"Unexpected Error: {str(e)}")
 
 def create_default_analysis_result(error: str = "Unknown error") -> Dict:
     """Create default analysis result when analysis fails"""
@@ -356,6 +347,7 @@ def elevenlabs_transcript_webhook():
         call_type = data.get('call_type', 'unknown')
         
         print(f"📞 Received ElevenLabs transcript for call: {call_id}")
+        print(f"📞 Transcript length: {len(transcript)} characters")
         
         if not transcript:
             return jsonify({'error': 'No transcript provided'}), 400
@@ -369,6 +361,7 @@ def elevenlabs_transcript_webhook():
         }
         
         # Analyze the transcript
+        print(f"📊 Starting analysis for ElevenLabs call: {call_id}")
         analysis_result = analyze_call_transcript(transcript, call_metadata)
         
         # Store call data
@@ -386,16 +379,38 @@ def elevenlabs_transcript_webhook():
         update_overall_stats(analysis_result, duration)
         update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
         
-        # Emit real-time update to dashboard
+        print(f"📊 Stored ElevenLabs call. Total calls now: {len(call_data_store['completed_calls'])}")
+        
+        # Emit BOTH events to ensure dashboard updates
         socketio.emit('new_call_analysis', {
             'call_id': call_id,
             'analysis': analysis_result,
             'duration': duration,
             'agent_id': agent_id,
-            'timestamp': datetime.now().strftime("%H:%M:%S")
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'source': 'elevenlabs'
         })
         
-        print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+        # Get fresh data for dashboard
+        recent_calls = list(call_data_store['completed_calls'].values())[-10:]
+        recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+        stats = call_data_store['overall_stats']
+        
+        socketio.emit('dashboard_data_update', {
+            'recent_calls': recent_calls,
+            'total_calls': stats['total_calls'],
+            'successful_calls': stats['successful_calls'],
+            'failed_calls': stats['failed_calls'],
+            'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+            'positive_interactions': stats['positive_interactions'],
+            'negative_interactions': stats['negative_interactions'],
+            'neutral_interactions': stats['neutral_interactions'],
+            'average_call_duration': round(stats['average_call_duration'], 1),
+            'kpi_averages': stats['kpi_averages']
+        })
+        
+        print(f"✅ Successfully analyzed ElevenLabs call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+        print(f"📡 Emitted WebSocket updates to dashboard")
         
         return jsonify({
             'status': 'success',
@@ -499,7 +514,9 @@ def xelion_audio_webhook():
                 update_overall_stats(analysis_result, duration)
                 update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
                 
-                # Emit real-time update
+                print(f"📊 Stored Xelion call. Total calls now: {len(call_data_store['completed_calls'])}")
+                
+                # Emit BOTH events to ensure dashboard updates
                 socketio.emit('new_call_analysis', {
                     'call_id': call_id,
                     'analysis': analysis_result,
@@ -507,10 +524,30 @@ def xelion_audio_webhook():
                     'agent_id': agent_id,
                     'timestamp': datetime.now().strftime("%H:%M:%S"),
                     'has_audio': unique_filename is not None,
-                    'transcript_source': transcript_source
+                    'transcript_source': transcript_source,
+                    'source': 'xelion'
                 })
                 
-                print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+                # Get fresh data for dashboard
+                recent_calls = list(call_data_store['completed_calls'].values())[-10:]
+                recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+                stats = call_data_store['overall_stats']
+                
+                socketio.emit('dashboard_data_update', {
+                    'recent_calls': recent_calls,
+                    'total_calls': stats['total_calls'],
+                    'successful_calls': stats['successful_calls'],
+                    'failed_calls': stats['failed_calls'],
+                    'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+                    'positive_interactions': stats['positive_interactions'],
+                    'negative_interactions': stats['negative_interactions'],
+                    'neutral_interactions': stats['neutral_interactions'],
+                    'average_call_duration': round(stats['average_call_duration'], 1),
+                    'kpi_averages': stats['kpi_averages']
+                })
+                
+                print(f"✅ Successfully analyzed Xelion call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+                print(f"📡 Emitted WebSocket updates to dashboard")
             else:
                 print(f"📞 No transcript available for call: {call_id}")
             
@@ -570,16 +607,39 @@ def xelion_audio_webhook():
                     update_overall_stats(analysis_result, duration)
                     update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
                     
+                    print(f"📊 Stored Xelion JSON call. Total calls now: {len(call_data_store['completed_calls'])}")
+                    
+                    # Emit BOTH events to ensure dashboard updates
                     socketio.emit('new_call_analysis', {
                         'call_id': call_id,
                         'analysis': analysis_result,
                         'duration': duration,
                         'agent_id': agent_id,
                         'timestamp': datetime.now().strftime("%H:%M:%S"),
-                        'transcript_source': 'provided'
+                        'transcript_source': 'provided',
+                        'source': 'xelion'
                     })
                     
-                    print(f"✅ Successfully analyzed call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+                    # Get fresh data for dashboard
+                    recent_calls = list(call_data_store['completed_calls'].values())[-10:]
+                    recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+                    stats = call_data_store['overall_stats']
+                    
+                    socketio.emit('dashboard_data_update', {
+                        'recent_calls': recent_calls,
+                        'total_calls': stats['total_calls'],
+                        'successful_calls': stats['successful_calls'],
+                        'failed_calls': stats['failed_calls'],
+                        'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+                        'positive_interactions': stats['positive_interactions'],
+                        'negative_interactions': stats['negative_interactions'],
+                        'neutral_interactions': stats['neutral_interactions'],
+                        'average_call_duration': round(stats['average_call_duration'], 1),
+                        'kpi_averages': stats['kpi_averages']
+                    })
+                    
+                    print(f"✅ Successfully analyzed Xelion JSON call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
+                    print(f"📡 Emitted WebSocket updates to dashboard")
                     
                     return jsonify({
                         'status': 'success',
