@@ -21,7 +21,7 @@ import aiohttp # For async HTTP client in websockets
 # Import the ElevenLabs Client
 from elevenlabs.client import ElevenLabs
 from elevenlabs import Voice, VoiceSettings, play
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+REDIS_URL = 'redis://localhost:6379/0'
 app = Flask(__name__)
 # Load environment variables from .env file
 load_dotenv()
