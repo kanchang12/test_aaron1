@@ -1,12 +1,10 @@
-flask
-flask-socketio
-openai
-twilio
-requests
+Flask
+Flask-SocketIO
 python-dotenv
-gunicorn
-eventlet
-python-socketio
-python-engineio
- websockets
+twilio
+openai
 elevenlabs
+websockets>=12.0 # Ensure this is up to date
+aiohttp>=3.9    # Add this or ensure it's up to date
+audioop
+redis
