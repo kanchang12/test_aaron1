@@ -4,7 +4,7 @@ import uuid
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-
+from chatbot import WasteKingChatbot
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- Initialize OpenAI Client ---
 client = OpenAI(api_key=OPENAI_API_KEY)
+chatbot_manager = WasteKingChatbot(OPENAI_API_KEY)
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -358,6 +359,36 @@ def update_daily_stats(date_str: str, analysis_result: Dict):
 @app.route('/')
 def dashboard():
     return render_template('dashboard.html')
+
+@app.route('/chatbot')
+def chatbot():
+    return render_template('chatbot.html')
+
+@app.route('/api/chat', methods=['POST'])
+def chat_api():
+    try:
+        data = request.get_json()
+        user_message = data.get('message')
+        session_id = data.get('session_id') # Get session_id from frontend
+
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+
+        if not session_id:
+            # Generate a new session ID if not provided (for first message from frontend)
+            session_id = str(uuid.uuid4())
+            print(f"🆕 New chatbot session ID generated for frontend: {session_id}")
+
+        # Use the chatbot_manager to get the AI response
+        ai_response = chatbot_manager.get_chat_response(session_id, user_message)
+
+        return jsonify({'response': ai_response, 'session_id': session_id})
+
+    except Exception as e:
+        print(f"❌ Error in chat API: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'An internal error occurred: ' + str(e)}), 500
 
 @app.route('/debug/calls')
 def debug_calls():
