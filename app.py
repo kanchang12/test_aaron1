@@ -391,25 +391,56 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
-# --- ElevenLabs Webhook Endpoint ---
+# --- ElevenLabs Webhook Endpoint - FIXED ---
 @app.route('/webhook/elevenlabs/transcript', methods=['POST'])
 def elevenlabs_transcript_webhook():
     """Receive post-call transcript from ElevenLabs"""
     try:
         data = request.get_json()
         
-        # Extract data from ElevenLabs webhook
-        call_id = data.get('conversation_id') or data.get('call_id') or str(uuid.uuid4())
-        transcript = data.get('transcript') or data.get('full_transcript', '')
-        agent_id = data.get('agent_id', 'unknown')
-        duration = data.get('duration_seconds', 0)
-        call_type = data.get('call_type', 'unknown')
+        # LOG THE ENTIRE PAYLOAD TO DEBUG
+        print(f"📞 ElevenLabs webhook payload: {json.dumps(data, indent=2)}")
         
-        print(f"📞 Received ElevenLabs transcript for call: {call_id}")
+        # Try multiple possible field names for transcript
+        transcript = ""
+        possible_transcript_fields = [
+            'transcript', 'full_transcript', 'text', 'content', 
+            'transcription', 'speech_text', 'result', 'output'
+        ]
+        
+        for field in possible_transcript_fields:
+            if field in data and data[field]:
+                transcript = data[field]
+                print(f"📞 Found transcript in field '{field}': {len(transcript)} characters")
+                break
+        
+        # Also check nested objects
+        if not transcript and 'data' in data:
+            for field in possible_transcript_fields:
+                if field in data['data'] and data['data'][field]:
+                    transcript = data['data'][field]
+                    print(f"📞 Found transcript in data.{field}: {len(transcript)} characters")
+                    break
+        
+        # Extract other fields with multiple possible names
+        call_id = (data.get('conversation_id') or data.get('call_id') or 
+                  data.get('id') or data.get('session_id') or str(uuid.uuid4()))
+        
+        agent_id = (data.get('agent_id') or data.get('user_id') or 
+                   data.get('operator_id') or 'unknown')
+        
+        duration = (data.get('duration_seconds') or data.get('duration') or 
+                   data.get('call_duration') or data.get('length') or 0)
+        
+        call_type = (data.get('call_type') or data.get('type') or 
+                    data.get('category') or 'unknown')
+        
+        print(f"📞 Extracted - Call ID: {call_id}, Agent: {agent_id}, Duration: {duration}s")
         print(f"📞 Transcript length: {len(transcript)} characters")
         
-        if not transcript:
-            return jsonify({'error': 'No transcript provided'}), 400
+        if not transcript or transcript.strip() == "":
+            print(f"❌ No transcript found in ElevenLabs webhook")
+            return jsonify({'error': 'No transcript provided', 'debug_payload': data}), 400
         
         # Prepare metadata
         call_metadata = {
@@ -474,6 +505,7 @@ def elevenlabs_transcript_webhook():
         return jsonify({
             'status': 'success',
             'call_id': call_id,
+            'transcript_length': len(transcript),
             'analysis_summary': {
                 'outcome': analysis_result.get('call_outcome'),
                 'sentiment': analysis_result.get('interaction_sentiment'),
