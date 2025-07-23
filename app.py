@@ -1,4 +1,24 @@
-import os
+# ALWAYS return a response regardless of analysis success
+            print(f"🚀 Returning response for call {call_id}")
+            
+            response_data = {
+                'status': 'success',
+                'call_id': call_id,
+                'audio_file': unique_filename,
+                'transcript_provided': bool(provided_transcript and provided_transcript.strip()),
+                'transcript_transcribed': transcript_source == "whisper_transcribed",
+                'analysis_completed': analysis_result is not None,
+                'message': f'Audio file uploaded successfully' + 
+                          (f' and transcript {transcript_source}' if transcript else ' - no transcript available'),
+                'analysis_summary': {
+                    'outcome': analysis_result.get('call_outcome') if analysis_result else 'pending',
+                    'sentiment': analysis_result.get('interaction_sentiment') if analysis_result else 'unknown',
+                    'overall_score': analysis_result.get('overall_score') if analysis_result else 0
+                } if analysis_result else None
+            }
+            
+            print(f"📤 Response prepared: {response_data['status']}")
+            return jsonify(response_data)import os
 import json
 import uuid
 import threading
