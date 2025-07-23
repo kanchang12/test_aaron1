@@ -289,13 +289,37 @@
     </div>
 
     <script>
-        // Initialize Socket.IO
-        const socket = io();
+        // Initialize Socket.IO with fallback to polling
+        const socket = io({
+            transports: ['polling', 'websocket'],
+            upgrade: true,
+            rememberUpgrade: false,
+            timeout: 5000,
+            forceNew: true
+        });
+
+        // Connection status tracking
+        let isConnected = false;
 
         // Socket event handlers
         socket.on('connect', () => {
             console.log('🟢 Connected to dashboard');
+            isConnected = true;
             loadData();
+        });
+
+        socket.on('connect_error', (error) => {
+            console.log('❌ Socket connection failed:', error);
+            isConnected = false;
+            // Fall back to polling-only mode
+            console.log('🔄 Falling back to API polling...');
+            startPolling();
+        });
+
+        socket.on('disconnect', () => {
+            console.log('🔴 Disconnected from dashboard');
+            isConnected = false;
+            startPolling();
         });
 
         socket.on('dashboard_data_update', (data) => {
@@ -310,6 +334,20 @@
             console.log('📞 New call analyzed:', data);
             setTimeout(loadData, 500);
         });
+
+        // Polling fallback for when WebSocket fails
+        let pollingInterval;
+        function startPolling() {
+            if (pollingInterval) clearInterval(pollingInterval);
+            console.log('🔄 Starting API polling mode...');
+            
+            pollingInterval = setInterval(() => {
+                if (!isConnected) {
+                    console.log('📡 Polling for updates...');
+                    loadData();
+                }
+            }, 5000); // Poll every 5 seconds
+        }
 
         // Update dashboard stats
         function updateStats(data) {
@@ -416,14 +454,16 @@
             container.innerHTML = '<div class="no-data"><div class="loading"></div><div style="margin-top: 10px;">Refreshing...</div></div>';
             
             loadData();
-            socket.emit('get_dashboard_data');
+            if (isConnected) {
+                socket.emit('get_dashboard_data');
+            }
         }
-
-        // Auto-refresh every 10 seconds
-        setInterval(loadData, 10000);
 
         // Initial load
         setTimeout(loadData, 1000);
+        
+        // Start polling as backup (will stop if WebSocket connects)
+        setTimeout(startPolling, 3000);
     </script>
 </body>
 </html>
