@@ -37,7 +37,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- Initialize OpenAI Client ---
 client = OpenAI(api_key=OPENAI_API_KEY)
-chatbot_manager = WasteKingChatbot(OPENAI_API_KEY)
+chatbot_manager = WasteKingChatbot()
 
 # --- Flask App Setup ---
 app = Flask(__name__)
