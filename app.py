@@ -4,7 +4,7 @@ import uuid
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from chatbot import WasteKingChatbot
+
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
@@ -37,7 +37,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- Initialize OpenAI Client ---
 client = OpenAI(api_key=OPENAI_API_KEY)
-chatbot_manager = WasteKingChatbot()
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -359,36 +358,6 @@ def update_daily_stats(date_str: str, analysis_result: Dict):
 @app.route('/')
 def dashboard():
     return render_template('dashboard.html')
-
-@app.route('/chatbot')
-def chatbot():
-    return render_template('chatbot.html')
-
-@app.route('/api/chat', methods=['POST'])
-def chat_api():
-    try:
-        data = request.get_json()
-        user_message = data.get('message')
-        session_id = data.get('session_id') # Get session_id from frontend
-
-        if not user_message:
-            return jsonify({'error': 'No message provided'}), 400
-
-        if not session_id:
-            # Generate a new session ID if not provided (for first message from frontend)
-            session_id = str(uuid.uuid4())
-            print(f"🆕 New chatbot session ID generated for frontend: {session_id}")
-
-        # Use the chatbot_manager to get the AI response
-        ai_response = chatbot_manager.get_chat_response(session_id, user_message)
-
-        return jsonify({'response': ai_response, 'session_id': session_id})
-
-    except Exception as e:
-        print(f"❌ Error in chat API: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': 'An internal error occurred: ' + str(e)}), 500
 
 @app.route('/debug/calls')
 def debug_calls():
@@ -878,6 +847,180 @@ def xelion_audio_webhook():
             'error_type': type(e).__name__,
             'message': 'Webhook processing failed'
         }), 500
+
+# --- Twilio Webhook Endpoint ---
+@app.route('/webhook/twilio/call', methods=['POST'])
+def twilio_call_webhook():
+    """Handle Twilio call webhooks (incoming calls to +447488891052)"""
+    try:
+        # Get Twilio webhook data
+        call_sid = request.form.get('CallSid')
+        from_number = request.form.get('From')  # Customer's number
+        to_number = request.form.get('To')      # Your 1052 number
+        call_status = request.form.get('CallStatus')
+        direction = request.form.get('Direction')
+        
+        print(f"📞 Twilio webhook: {call_status}")
+        print(f"📞 Call SID: {call_sid}")
+        print(f"📞 From: {from_number} → To: {to_number}")
+        print(f"📞 Direction: {direction}")
+        
+        # Handle different call statuses
+        if call_status in ['ringing', 'in-progress']:
+            print(f"📞 Call {call_status}: {call_sid}")
+            
+            # Return TwiML to connect call to your chatbot or agent
+            twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="alice">Hello, welcome to Waste King. Please hold while we connect you to our AI assistant.</Say>
+    <Dial>
+        <Number>+447866770520</Number>
+    </Dial>
+</Response>"""
+            
+            return twiml_response, 200, {'Content-Type': 'text/xml'}
+            
+        elif call_status == 'completed':
+            print(f"📞 Call completed: {call_sid}")
+            
+            # Get call details for analysis
+            duration = request.form.get('CallDuration', 0)
+            recording_url = request.form.get('RecordingUrl', '')
+            
+            if recording_url:
+                print(f"🎵 Recording available: {recording_url}")
+                # You could download and transcribe the recording here
+                
+            return jsonify({'status': 'call_logged'}), 200
+            
+        elif call_status in ['failed', 'busy', 'no-answer']:
+            print(f"❌ Call {call_status}: {call_sid}")
+            return jsonify({'status': 'call_failed'}), 200
+            
+        else:
+            print(f"📞 Unhandled call status: {call_status}")
+            return jsonify({'status': 'received'}), 200
+            
+    except Exception as e:
+        print(f"❌ Error processing Twilio webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/webhook/twilio/recording', methods=['POST'])
+def twilio_recording_webhook():
+    """Handle Twilio recording webhooks"""
+    try:
+        call_sid = request.form.get('CallSid')
+        recording_sid = request.form.get('RecordingSid')
+        recording_url = request.form.get('RecordingUrl')
+        duration = int(request.form.get('RecordingDuration', 0))
+        
+        print(f"🎵 Twilio recording webhook:")
+        print(f"📞 Call SID: {call_sid}")
+        print(f"🎵 Recording SID: {recording_sid}")
+        print(f"🎵 Recording URL: {recording_url}")
+        print(f"⏱️  Duration: {duration} seconds")
+        
+        if recording_url and duration > 0:
+            # Download and transcribe the recording
+            try:
+                import requests
+                
+                # Download the recording
+                response = requests.get(recording_url + '.mp3')
+                if response.status_code == 200:
+                    # Save to file
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"twilio_recording_{call_sid}_{timestamp}.mp3"
+                    file_path = os.path.join(UPLOAD_FOLDER, filename)
+                    
+                    with open(file_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    print(f"💾 Recording saved: {filename}")
+                    
+                    # Transcribe the recording
+                    transcript = transcribe_audio(file_path)
+                    
+                    if transcript:
+                        # Analyze the call
+                        call_metadata = {
+                            'duration': duration,
+                            'agent_id': 'twilio_system',
+                            'call_type': 'voice',
+                            'source': 'twilio',
+                            'call_sid': call_sid,
+                            'recording_sid': recording_sid,
+                            'audio_file': filename
+                        }
+                        
+                        analysis_result = analyze_call_transcript(transcript, call_metadata)
+                        
+                        # Store call data
+                        call_record = {
+                            'call_id': call_sid,
+                            'transcript': transcript,
+                            'analysis': analysis_result,
+                            'metadata': call_metadata,
+                            'timestamp': datetime.now().isoformat(),
+                            'duration': duration,
+                            'source': 'twilio',
+                            'audio_file': filename,
+                            'recording_url': recording_url
+                        }
+                        
+                        call_data_store['completed_calls'][call_sid] = call_record
+                        update_overall_stats(analysis_result, duration)
+                        update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
+                        
+                        print(f"✅ Twilio call analyzed: {analysis_result.get('call_outcome')}")
+                        
+                        # Emit dashboard updates
+                        socketio.emit('new_call_analysis', {
+                            'call_id': call_sid,
+                            'analysis': analysis_result,
+                            'duration': duration,
+                            'agent_id': 'twilio_system',
+                            'timestamp': datetime.now().strftime("%H:%M:%S"),
+                            'source': 'twilio',
+                            'has_recording': True
+                        })
+                        
+                        # Update dashboard
+                        recent_calls = list(call_data_store['completed_calls'].values())[-10:]
+                        recent_calls = sorted(recent_calls, key=lambda x: x['timestamp'], reverse=True)
+                        stats = call_data_store['overall_stats']
+                        
+                        socketio.emit('dashboard_data_update', {
+                            'recent_calls': recent_calls,
+                            'total_calls': stats['total_calls'],
+                            'successful_calls': stats['successful_calls'],
+                            'failed_calls': stats['failed_calls'],
+                            'success_rate': round((stats['successful_calls'] / max(stats['total_calls'], 1)) * 100, 1),
+                            'positive_interactions': stats['positive_interactions'],
+                            'negative_interactions': stats['negative_interactions'],
+                            'neutral_interactions': stats['neutral_interactions'],
+                            'average_call_duration': round(stats['average_call_duration'], 1),
+                            'kpi_averages': stats['kpi_averages']
+                        })
+                        
+                    else:
+                        print(f"❌ Failed to transcribe Twilio recording: {filename}")
+                        
+                else:
+                    print(f"❌ Failed to download recording: {response.status_code}")
+                    
+            except Exception as download_error:
+                print(f"❌ Error downloading/processing recording: {download_error}")
+        
+        return jsonify({'status': 'recording_processed'}), 200
+        
+    except Exception as e:
+        print(f"❌ Error processing Twilio recording webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 # --- API Endpoints ---
 @app.route('/api/stats')
