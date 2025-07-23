@@ -408,19 +408,57 @@ def elevenlabs_transcript_webhook():
             'transcription', 'speech_text', 'result', 'output'
         ]
         
+        # Check main level fields
         for field in possible_transcript_fields:
             if field in data and data[field]:
-                transcript = data[field]
-                print(f"📞 Found transcript in field '{field}': {len(transcript)} characters")
-                break
+                transcript_data = data[field]
+                # Handle if transcript is a list/array
+                if isinstance(transcript_data, list):
+                    transcript = ' '.join(str(item) for item in transcript_data if item)
+                elif isinstance(transcript_data, str):
+                    transcript = transcript_data
+                else:
+                    transcript = str(transcript_data)
+                
+                if transcript.strip():
+                    print(f"📞 Found transcript in field '{field}': {len(transcript)} characters")
+                    break
         
-        # Also check nested objects
+        # Check nested objects
         if not transcript and 'data' in data:
             for field in possible_transcript_fields:
                 if field in data['data'] and data['data'][field]:
-                    transcript = data['data'][field]
-                    print(f"📞 Found transcript in data.{field}: {len(transcript)} characters")
-                    break
+                    transcript_data = data['data'][field]
+                    # Handle if transcript is a list/array
+                    if isinstance(transcript_data, list):
+                        transcript = ' '.join(str(item) for item in transcript_data if item)
+                    elif isinstance(transcript_data, str):
+                        transcript = transcript_data
+                    else:
+                        transcript = str(transcript_data)
+                    
+                    if transcript.strip():
+                        print(f"📞 Found transcript in data.{field}: {len(transcript)} characters")
+                        break
+        
+        # If still no transcript, try to build it from messages array
+        if not transcript and 'messages' in data:
+            print("📞 Building transcript from messages array...")
+            transcript_parts = []
+            for message in data['messages']:
+                if 'role' in message and 'message' in message and message['message']:
+                    role = message['role'].title()  # Agent/User
+                    content = message['message']
+                    transcript_parts.append(f"{role}: {content}")
+            
+            transcript = '\n'.join(transcript_parts)
+            if transcript:
+                print(f"📞 Built transcript from messages: {len(transcript)} characters")
+        
+        # Try transcript_summary if available
+        if not transcript and 'analysis' in data and 'transcript_summary' in data['analysis']:
+            transcript = data['analysis']['transcript_summary']
+            print(f"📞 Using transcript_summary: {len(transcript)} characters")
         
         # Extract other fields with multiple possible names
         call_id = (data.get('conversation_id') or data.get('call_id') or 
@@ -429,8 +467,13 @@ def elevenlabs_transcript_webhook():
         agent_id = (data.get('agent_id') or data.get('user_id') or 
                    data.get('operator_id') or 'unknown')
         
-        duration = (data.get('duration_seconds') or data.get('duration') or 
-                   data.get('call_duration') or data.get('length') or 0)
+        # Try to get duration from metadata
+        duration = 0
+        if 'metadata' in data and 'call_duration_secs' in data['metadata']:
+            duration = data['metadata']['call_duration_secs']
+        else:
+            duration = (data.get('duration_seconds') or data.get('duration') or 
+                       data.get('call_duration') or data.get('length') or 0)
         
         call_type = (data.get('call_type') or data.get('type') or 
                     data.get('category') or 'unknown')
@@ -438,9 +481,15 @@ def elevenlabs_transcript_webhook():
         print(f"📞 Extracted - Call ID: {call_id}, Agent: {agent_id}, Duration: {duration}s")
         print(f"📞 Transcript length: {len(transcript)} characters")
         
-        if not transcript or transcript.strip() == "":
+        if not transcript or not str(transcript).strip():
             print(f"❌ No transcript found in ElevenLabs webhook")
-            return jsonify({'error': 'No transcript provided', 'debug_payload': data}), 400
+            print(f"📞 Available top-level keys: {list(data.keys())}")
+            if 'data' in data:
+                print(f"📞 Available data keys: {list(data['data'].keys())}")
+            return jsonify({'error': 'No transcript provided', 'debug_payload_keys': list(data.keys())}), 400
+        
+        # Ensure transcript is a string
+        transcript = str(transcript).strip()
         
         # Prepare metadata
         call_metadata = {
@@ -506,6 +555,7 @@ def elevenlabs_transcript_webhook():
             'status': 'success',
             'call_id': call_id,
             'transcript_length': len(transcript),
+            'transcript_source': 'messages_array' if 'messages' in data else 'direct_field',
             'analysis_summary': {
                 'outcome': analysis_result.get('call_outcome'),
                 'sentiment': analysis_result.get('interaction_sentiment'),
