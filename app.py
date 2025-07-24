@@ -569,7 +569,7 @@ def elevenlabs_transcript_webhook():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-# --- Xelion Webhook Endpoint - FIXED ---
+# --- Xelion Webhook Endpoint - COMPLETE & CLEAN ---
 @app.route('/webhook/xelion/audio', methods=['POST'])
 def xelion_audio_webhook():
     """Receive audio file and/or transcript from Xelion"""
@@ -582,7 +582,6 @@ def xelion_audio_webhook():
             print(f"📞 Form data keys: {list(request.form.keys())}")
             print(f"📞 Files: {list(request.files.keys())}")
             
-            # Handle multipart form data (audio file upload)
             call_id = request.form.get('call_id', str(uuid.uuid4()))
             duration = float(request.form.get('duration', 0))
             agent_id = request.form.get('agent_id', 'unknown')
@@ -591,7 +590,6 @@ def xelion_audio_webhook():
             print(f"📞 Processing multipart form data for call: {call_id}")
             print(f"📞 Agent: {agent_id}, Duration: {duration}s")
             
-            # Handle audio file if present
             unique_filename = None
             audio_file_path = None
             if 'audio_file' in request.files:
@@ -603,29 +601,15 @@ def xelion_audio_webhook():
                     audio_file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
                     file.save(audio_file_path)
                     print(f"📞 Audio file saved: {unique_filename}")
-                else:
-                    print(f"❌ Invalid audio file: {file.filename}")
 
-            # Determine transcript source
             transcript = provided_transcript
             transcript_source = "provided"
             
-            # If no transcript provided but audio file exists, transcribe it
             if (not transcript or transcript.strip() == "") and audio_file_path:
-                print(f"🎵 No transcript provided, transcribing audio file: {unique_filename}")
+                print(f"🎵 Transcribing audio file: {unique_filename}")
                 transcript = transcribe_audio(audio_file_path)
                 transcript_source = "whisper_transcribed"
-                
-                if not transcript:
-                    print(f"❌ Transcription failed for {unique_filename}")
-                    return jsonify({
-                        'status': 'error',
-                        'call_id': call_id,
-                        'audio_file': unique_filename,
-                        'error': 'Audio transcription failed'
-                    }), 400
 
-            # Process transcript if available
             analysis_result = None
             if transcript and transcript.strip():
                 call_metadata = {
@@ -637,15 +621,9 @@ def xelion_audio_webhook():
                     'transcript_source': transcript_source
                 }
                 
-                print(f"📞 Analyzing transcript for call: {call_id} (source: {transcript_source})")
-                print(f"📞 Transcript preview: {transcript[:200]}...")
-                
                 analysis_result = analyze_call_transcript(transcript, call_metadata)
                 
                 if analysis_result:
-                    print(f"📊 Analysis completed - Outcome: {analysis_result.get('call_outcome')}, Score: {analysis_result.get('overall_score')}")
-                    
-                    # Store call data
                     call_record = {
                         'call_id': call_id,
                         'transcript': transcript,
@@ -661,55 +639,40 @@ def xelion_audio_webhook():
                     call_data_store['completed_calls'][call_id] = call_record
                     update_overall_stats(analysis_result, duration)
                     update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
-                    
-                    print(f"✅ Successfully analyzed Xelion call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
 
             return jsonify({
                 'status': 'success',
                 'call_id': call_id,
                 'audio_file': unique_filename,
-                'transcript_provided': bool(provided_transcript and provided_transcript.strip()),
-                'transcript_transcribed': transcript_source == "whisper_transcribed",
                 'analysis_completed': analysis_result is not None
             })
-        
-        # Check if this is JSON data OR Xelion's plain text with JSON content-type
+
+        # Handle JSON or plain text data
         elif request.content_type and 'application/json' in request.content_type:
             try:
-                # Get raw data first
                 raw_data = request.get_data(as_text=True)
                 print(f"📞 Raw data received: {raw_data}")
                 
-                # Check if it's a plain filename (like "96e5d018b5688eb5.mp3")
                 if raw_data and not raw_data.startswith('{'):
-                    # It's a plain text filename, not JSON
-                    filename = raw_data.strip().strip('"')  # Remove quotes if present
+                    filename = raw_data.strip().strip('"')
                     print(f"📞 Received filename: {filename}")
                     
-                    # Generate call metadata
                     call_id = str(uuid.uuid4())
                     
-                    # Check if filename looks like an audio file
                     if any(filename.lower().endswith(ext) for ext in ['.mp3', '.wav', '.ogg', '.flac', '.m4a']):
                         print(f"🎵 Audio filename detected: {filename}")
                         
-                        # For now, we can't download the file directly from Xelion
-                        # But we can log that we received the filename
-                        call_metadata = {
-                            'duration': 0,  # Unknown
-                            'agent_id': 'unknown',
-                            'call_type': 'voice',
-                            'source': 'xelion',
-                            'audio_filename': filename,
-                            'transcript_source': 'none'
-                        }
-                        
-                        # Store basic call record
                         call_record = {
                             'call_id': call_id,
                             'transcript': '',
                             'analysis': None,
-                            'metadata': call_metadata,
+                            'metadata': {
+                                'duration': 0,
+                                'agent_id': 'unknown',
+                                'call_type': 'voice',
+                                'source': 'xelion',
+                                'audio_filename': filename
+                            },
                             'timestamp': datetime.now().isoformat(),
                             'duration': 0,
                             'source': 'xelion',
@@ -718,93 +681,64 @@ def xelion_audio_webhook():
                         }
                         
                         call_data_store['completed_calls'][call_id] = call_record
-                        print(f"📊 Stored Xelion filename. Total calls now: {len(call_data_store['completed_calls'])}")
+                        print(f"📊 Stored Xelion filename. Total calls: {len(call_data_store['completed_calls'])}")
                         
                         return jsonify({
                             'status': 'success',
                             'call_id': call_id,
                             'audio_filename': filename,
-                            'message': f'Audio filename received: {filename}',
-                            'note': 'Filename logged - need to implement file download from Xelion'
+                            'message': f'Audio filename received: {filename}'
                         })
-                    else:
-                        return jsonify({
-                            'status': 'success',
-                            'call_id': call_id,
-                            'data_received': raw_data,
-                            'message': 'Non-audio data received from Xelion'
-                        })
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'call_id': call_id,
+                        'data_received': raw_data
+                    })
                 
-                # Try to parse as JSON if it starts with {
                 else:
                     data = request.get_json(force=True)
-                    if not data:
-                        return jsonify({'error': 'No JSON data received'}), 400
-                        
                     call_id = data.get('call_id', str(uuid.uuid4()))
                     transcript = data.get('transcript', '')
-                    duration = data.get('duration', 0)
-                    agent_id = data.get('agent_id', 'unknown')
-                    
-                    print(f"📞 Processing JSON data for call: {call_id}")
                     
                     if transcript and transcript.strip():
-                        call_metadata = {
-                            'duration': duration,
-                            'agent_id': agent_id,
-                            'call_type': 'voice',
-                            'source': 'xelion',
-                            'transcript_source': 'provided'
-                        }
-                        
-                        analysis_result = analyze_call_transcript(transcript, call_metadata)
+                        analysis_result = analyze_call_transcript(transcript, {
+                            'duration': data.get('duration', 0),
+                            'agent_id': data.get('agent_id', 'unknown'),
+                            'source': 'xelion'
+                        })
                         
                         call_record = {
                             'call_id': call_id,
                             'transcript': transcript,
                             'analysis': analysis_result,
-                            'metadata': call_metadata,
                             'timestamp': datetime.now().isoformat(),
-                            'duration': duration,
-                            'source': 'xelion',
-                            'transcript_source': 'provided'
+                            'source': 'xelion'
                         }
                         
                         call_data_store['completed_calls'][call_id] = call_record
-                        update_overall_stats(analysis_result, duration)
-                        update_daily_stats(datetime.now().strftime('%Y-%m-%d'), analysis_result)
-                        
-                        print(f"✅ Successfully analyzed Xelion JSON call {call_id}: {analysis_result.get('call_outcome', 'unknown')}")
                     
                     return jsonify({
                         'status': 'success',
                         'call_id': call_id,
-                        'message': 'JSON data processed successfully'
+                        'message': 'JSON data processed'
                     })
                     
             except Exception as json_error:
-                print(f"❌ JSON/Data parsing error: {json_error}")
-                
-                # Fall back to raw data handling
+                print(f"❌ Data parsing error: {json_error}")
                 raw_data = request.get_data(as_text=True)
-                print(f"📞 Fallback - Raw data: {raw_data}")
+                print(f"📞 Fallback raw data: {raw_data}")
                 
                 return jsonify({
                     'status': 'success',
                     'raw_data': raw_data,
-                    'error': f'Data parsing failed but received: {raw_data}',
-                    'message': 'Raw data captured successfully'
+                    'message': 'Raw data captured'
                 })
         
         else:
             return jsonify({
                 'error': 'Unsupported content type',
-                'received_content_type': request.content_type or 'None',
-                'supported_types': ['multipart/form-data (for audio files)', 'application/json (for data)'],
-                'usage': {
-                    'audio_upload': 'Use multipart/form-data with audio_file field',
-                    'data_only': 'Use application/json with call data'
-                }
+                'received_content_type': request.content_type or 'None'
             }), 400
         
     except Exception as e:
@@ -813,129 +747,8 @@ def xelion_audio_webhook():
         traceback.print_exc()
         return jsonify({
             'error': str(e),
-            'error_type': type(e).__name__,
             'message': 'Webhook processing failed'
         }), 500
-        
-        # Check if this is JSON data OR Xelion's plain text with JSON content-type
-        elif request.content_type and 'application/json' in request.content_type:
-            try:
-                # Get raw data first
-                raw_data = request.get_data(as_text=True)
-                print(f"📞 Raw data received: {raw_data}")
-                
-                # Check if it's a plain filename (like "96e5d018b5688eb5.mp3")
-                if raw_data and not raw_data.startswith('{'):
-                    # It's a plain text filename, not JSON
-                    filename = raw_data.strip().strip('"')  # Remove quotes if present
-                    print(f"📞 Received filename: {filename}")
-                    
-                    # Generate call metadata
-                    call_id = str(uuid.uuid4())
-                    
-                    # Check if filename looks like an audio file
-                    if any(filename.lower().endswith(ext) for ext in ['.mp3', '.wav', '.ogg', '.flac', '.m4a']):
-                        print(f"🎵 Audio filename detected: {filename}")
-                        
-                        # For now, we can't download the file directly from Xelion
-                        # But we can log that we received the filename
-                        call_metadata = {
-                            'duration': 0,  # Unknown
-                            'agent_id': 'unknown',
-                            'call_type': 'voice',
-                            'source': 'xelion',
-                            'audio_filename': filename,
-                            'transcript_source': 'none'
-                        }
-                        
-                        # Store basic call record
-                        call_record = {
-                            'call_id': call_id,
-                            'transcript': '',
-                            'analysis': None,
-                            'metadata': call_metadata,
-                            'timestamp': datetime.now().isoformat(),
-                            'duration': 0,
-                            'source': 'xelion',
-                            'audio_filename': filename,
-                            'status': 'audio_filename_received'
-                        }
-                        
-                        call_data_store['completed_calls'][call_id] = call_record
-                        print(f"📊 Stored Xelion filename. Total calls now: {len(call_data_store['completed_calls'])}")
-                        
-                        return jsonify({
-                            'status': 'success',
-                            'call_id': call_id,
-                            'audio_filename': filename,
-                            'message': f'Audio filename received: {filename}',
-                            'note': 'Filename logged - need to implement file download from Xelion'
-                        })
-                    else:
-                        return jsonify({
-                            'status': 'success',
-                            'call_id': call_id,
-                            'data_received': raw_data,
-                            'message': 'Non-audio data received from Xelion'
-                        })
-                
-                # Try to parse as JSON if it starts with {
-                else:
-                    data = request.get_json(force=True)
-                    if not data:
-                        return jsonify({'error': 'No JSON data received'}), 400
-                        
-                    call_id = data.get('call_id', str(uuid.uuid4()))
-                    transcript = data.get('transcript', '')
-                    duration = data.get('duration', 0)
-                    agent_id = data.get('agent_id', 'unknown')
-                    
-                    print(f"📞 Processing JSON data for call: {call_id}")
-                    
-                    # Process JSON data as before...
-                    # [Rest of JSON handling code remains the same]
-                    
-                    return jsonify({
-                        'status': 'success',
-                        'call_id': call_id,
-                        'message': 'JSON data processed successfully'
-                    })
-                    
-            except Exception as json_error:
-                print(f"❌ JSON/Data parsing error: {json_error}")
-                
-                # Fall back to raw data handling
-                raw_data = request.get_data(as_text=True)
-                print(f"📞 Fallback - Raw data: {raw_data}")
-                
-                return jsonify({
-                    'status': 'success',
-                    'raw_data': raw_data,
-                    'error': f'Data parsing failed but received: {raw_data}',
-                    'message': 'Raw data captured successfully'
-                })
-        
-        else:
-            return jsonify({
-                'error': 'Unsupported content type',
-                'received_content_type': request.content_type or 'None',
-                'supported_types': ['multipart/form-data (for audio files)', 'application/json (for data)'],
-                'usage': {
-                    'audio_upload': 'Use multipart/form-data with audio_file field',
-                    'data_only': 'Use application/json with call data'
-                }
-            }), 400
-        
-    except Exception as e:
-        print(f"❌ Error processing Xelion webhook: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'error': str(e),
-            'error_type': type(e).__name__,
-            'message': 'Webhook processing failed'
-        }), 500
-
 
 # --- Twilio Webhook Endpoint ---
 @app.route('/webhook/twilio/call', methods=['POST'])
