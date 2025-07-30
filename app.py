@@ -335,26 +335,29 @@ class LiveCallMonitor:
         
         try:
             # Download audio
+            logger.info(f"🎵 DOWNLOADING AUDIO: {call_id}")
             audio_file = self.download_audio(call_id)
             if not audio_file:
-                logger.warning(f"No audio file for call {call_id}")
+                logger.warning(f"❌ NO AUDIO AVAILABLE: {call_id}")
                 return
             
             # Transcribe
+            logger.info(f"🎙️  TRANSCRIBING AUDIO: {call_id}")
             transcript = self.transcribe_audio(audio_file, call_id)
             
             # Clean up audio file immediately
             try:
                 os.unlink(audio_file)
-                logger.info(f"Deleted audio file for call {call_id}")
+                logger.info(f"🗑️  AUDIO DELETED: {call_id}")
             except:
-                pass
+                logger.error(f"❌ FAILED TO DELETE AUDIO: {call_id}")
                 
             if not transcript:
-                logger.warning(f"No transcript for call {call_id}")
+                logger.warning(f"❌ TRANSCRIPTION FAILED: {call_id}")
                 return
             
             # Analyze
+            logger.info(f"🧠 ANALYZING CALL: {call_id}")
             analysis = self.analyze_call(transcript, call_id)
             
             # Store in database with all 18 KPIs
