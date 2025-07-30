@@ -203,9 +203,8 @@ class LiveCallMonitor:
     def get_recent_calls(self, minutes_back: int = 10) -> List[Dict]:
         """Get recent calls using the working API method"""
         until_date = datetime.now()
-        from_date = until_date - timedelta(minutes=minutes_back)
         
-        logger.info(f"🔍 CHECKING FOR CALLS FROM {from_date.strftime('%H:%M:%S')} TO {until_date.strftime('%H:%M:%S')}")
+        logger.info(f"🔍 FETCHING ALL COMMUNICATIONS...")
         
         communications, _ = self._fetch_communications_page(
             limit=50, 
@@ -214,32 +213,17 @@ class LiveCallMonitor:
         
         logger.info(f"📞 GOT {len(communications)} COMMUNICATIONS FROM API")
         
-        # Filter for new calls within time range
+        # Process ALL calls - no filtering
         new_calls = []
         for comm in communications:
             comm_obj = comm.get('object', {})
             call_id = comm_obj.get('oid')
-            call_date_str = comm_obj.get('date')
             
-            if not call_id:
-                continue
-                
-            # Parse call date and check if within range
-            if call_date_str:
-                try:
-                    call_date = datetime.strptime(call_date_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
-                    if call_date < from_date:
-                        continue  # Too old
-                except:
-                    pass  # If date parsing fails, include it anyway
-            
-            if call_id not in self.processed_calls:
+            if call_id:
                 new_calls.append(comm_obj)
-                logger.info(f"🆕 NEW CALL FOUND: {call_id} at {call_date_str}")
-            else:
-                logger.info(f"⏭️ ALREADY PROCESSED: {call_id}")
+                logger.info(f"🆕 CALL FOUND: {call_id}")
                 
-        logger.info(f"✅ RETURNING {len(new_calls)} NEW CALLS FOR PROCESSING")
+        logger.info(f"✅ RETURNING {len(new_calls)} CALLS FOR PROCESSING")
         return new_calls
 
     def download_audio(self, communication_oid: str) -> Optional[str]:
@@ -408,9 +392,6 @@ class LiveCallMonitor:
             return
             
         logger.info(f"🎯 PROCESSING CALL: {call_id}")
-        
-        # Add to processed set immediately to prevent duplicates
-        self.processed_calls.add(call_id)
         
         # Extract metadata
         agent_id = call_data.get('agentId', 'Unknown')
