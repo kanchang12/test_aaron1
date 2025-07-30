@@ -1,4 +1,19 @@
-from flask import Flask, render_template, jsonify, request
+def download_audio(self, communication_oid: str) -> Optional[str]:
+        """Download audio file for a communication and save it to a designated folder."""
+        audio_url = f"{self.xelion_base_url}/communications/{communication_oid}/audio"
+        
+        file_name = f"{communication_oid}.mp3"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+        temp_file.close()
+        file_path = temp_file.name
+
+        try:
+            response = self.session.get(audio_url, timeout=60) 
+            
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 import requests
 import json
@@ -30,7 +45,7 @@ class LiveCallMonitor:
     def __init__(self):
         # API Configuration
         self.xelion_base_url = os.environ.get('XELION_BASE_URL', 'https://lvsl01.xelion.com/api/v1/wasteking')
-        self.xelion_username = os.environ.get('XELION_USERNAME', 'abi.housego@wasteking.co.uk')
+        self._xelion_username = os.environ.get('XELION_USERNAME', 'abi.housego@wasteking.co.uk')
         self.xelion_password = os.environ.get('XELION_PASSWORD', 'Passw0rd#')
         self.xelion_app_key = os.environ.get('XELION_APP_KEY', 'NtYFnwKdrqbuXAd4N88txxnim2Nd6LnE')
         self.userspace = os.environ.get('XELION_USERSPACE', None)
@@ -55,7 +70,7 @@ class LiveCallMonitor:
         self.init_database()
         
         # Login to Xelion
-        self.login()
+        self.login(self._xelion_username)
 
     def init_database(self):
         """Initialize SQLite database for storing call data with 18 KPIs"""
@@ -75,6 +90,7 @@ class LiveCallMonitor:
                 priority INTEGER,
                 call_outcome TEXT,
                 overall_score REAL,
+                agent_id TEXT,
                 
                 -- Call Success & Resolution KPIs
                 call_success_rate REAL,
@@ -109,99 +125,209 @@ class LiveCallMonitor:
         conn.commit()
         conn.close()
 
-    def login(self) -> bool:
-        """Login to Xelion API"""
+    def _get_userspace_for_login(self, current_username: str) -> str:
+        """Determines the userspace to use for a given username during login."""
+        if self.userspace:
+            return self.userspace
+        return f"transcriber-{current_username.split('@')[0].replace('.', '-')}" 
+
+    def login(self, username_to_login: str = None) -> bool:
+        """
+        Authenticate with Xelion using the provided username (or self._xelion_username)
+        and obtain a session token.
+        """
+        if username_to_login is None:
+            username_to_login = self._xelion_username
+        
         login_url = f"{self.xelion_base_url}/me/login"
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json"
+        }
         
-        userspace = self.userspace or f"transcriber-{self.xelion_username.split('@')[0].replace('.', '-')}"
-        
-        data = {
-            "userName": self.xelion_username,
+        current_userspace = self._get_userspace_for_login(username_to_login)
+
+        data_payload = { 
+            "userName": username_to_login, 
             "password": self.xelion_password,
-            "userSpace": userspace,
+            "userSpace": current_userspace,     
             "appKey": self.xelion_app_key
         }
         
+        json_data_string = json.dumps(data_payload)
+        
+        logger.info(f"🔑 ATTEMPTING LOGIN: {username_to_login}")
+        
         try:
-            response = self.session.post(login_url, headers=headers, data=json.dumps(data))
-            response.raise_for_status()
+            response = self.session.post(login_url, headers=headers, data=json_data_string)
+            response.raise_for_status() 
             
             login_response = response.json()
             self.session_token = login_response.get("authentication")
             self.session.headers.update({"Authorization": f"xelion {self.session_token}"})
             
-            logger.info(f"Successfully logged in to Xelion as {self.xelion_username}")
+            valid_until = login_response.get('validUntil', 'N/A')
+            logger.info(f"✅ LOGIN SUCCESS: {username_to_login} (Valid until: {valid_until})")
             return True
-        except Exception as e:
-            logger.error(f"Failed to login to Xelion: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ LOGIN FAILED: {username_to_login}: {e}")
+            if e.response is not None:
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response: {e.response.text}")
             return False
 
     def get_recent_calls(self, minutes_back: int = 10) -> List[Dict]:
-        """Fetch recent calls from Xelion API"""
+        """Get recent calls using the working API method"""
         until_date = datetime.now()
         from_date = until_date - timedelta(minutes=minutes_back)
         
-        params = {
-            'limit': 50,
-            'until': until_date.strftime('%Y-%m-%d %H:%M:%S'),
-            'from': from_date.strftime('%Y-%m-%d %H:%M:%S')
-        }
+        logger.info(f"🔍 CHECKING FOR CALLS FROM {from_date.strftime('%H:%M:%S')} TO {until_date.strftime('%H:%M:%S')}")
         
-        logger.info(f"🔎 SEARCHING CALLS FROM {from_date.strftime('%H:%M:%S')} TO {until_date.strftime('%H:%M:%S')}")
+        communications, _ = self._fetch_communications_page(
+            limit=50, 
+            until_date=until_date
+        )
         
-        communications_url = f"{self.xelion_base_url}/communications"
-        logger.info(f"🌐 API URL: {communications_url}")
-        logger.info(f"📋 API PARAMS: {params}")
+        logger.info(f"📞 GOT {len(communications)} COMMUNICATIONS FROM API")
         
-        try:
-            response = self.session.get(communications_url, params=params, timeout=30)
-            logger.info(f"📡 API RESPONSE STATUS: {response.status_code}")
+        # Filter for new calls within time range
+        new_calls = []
+        for comm in communications:
+            comm_obj = comm.get('object', {})
+            call_id = comm_obj.get('oid')
+            call_date_str = comm_obj.get('date')
             
-            if response.status_code != 200:
-                logger.error(f"❌ API ERROR: {response.status_code} - {response.text[:500]}")
-                return []
-            
-            response.raise_for_status()
-            
-            data = response.json()
-            logger.info(f"📊 RAW API RESPONSE: {json.dumps(data, indent=2)[:1000]}...")
-            
-            communications = data.get('data', [])
-            
-            logger.info(f"📞 XELION API RETURNED {len(communications)} TOTAL COMMUNICATIONS")
-            
-            # Show details of first few communications
-            for i, comm in enumerate(communications[:3]):
-                comm_obj = comm.get('object', {})
-                call_id = comm_obj.get('oid', 'NO_ID')
-                call_date = comm_obj.get('date', 'NO_DATE')
-                logger.info(f"📋 COMM #{i+1}: ID={call_id}, DATE={call_date}")
-            
-            # Filter for new calls
-            new_calls = []
-            for comm in communications:
-                comm_obj = comm.get('object', {})
-                call_id = comm_obj.get('oid')
+            if not call_id:
+                continue
                 
-                if call_id and call_id not in self.processed_calls:
-                    new_calls.append(comm_obj)
-                    logger.info(f"🆕 NEW CALL FOUND: {call_id}")
-                elif call_id:
-                    logger.info(f"⏭️  SKIPPING ALREADY PROCESSED: {call_id}")
-                else:
-                    logger.warning(f"⚠️  COMMUNICATION WITH NO ID: {comm_obj}")
+            # Parse call date and check if within range
+            if call_date_str:
+                try:
+                    call_date = datetime.strptime(call_date_str.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                    if call_date < from_date:
+                        continue  # Too old
+                except:
+                    pass  # If date parsing fails, include it anyway
+            
+            if call_id not in self.processed_calls:
+                new_calls.append(comm_obj)
+                logger.info(f"🆕 NEW CALL FOUND: {call_id} at {call_date_str}")
+            else:
+                logger.info(f"⏭️ ALREADY PROCESSED: {call_id}")
+                
+        logger.info(f"✅ RETURNING {len(new_calls)} NEW CALLS FOR PROCESSING")
+        return new_calls
+
+    def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
+        """
+        Fetches a single page of communications.
+        Returns (list_of_communications, next_before_oid_for_paging).
+        """
+        params = {'limit': limit}
+        if until_date:
+            params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
+        if before_oid:
+            params['before'] = before_oid
+
+        base_urls_to_try = [
+            self.xelion_base_url,  
+            self.xelion_base_url.replace('/wasteking', '/master'), 
+            'https://lvsl01.xelion.com/api/v1/master', 
+        ]
+        
+        for base_url in base_urls_to_try:
+            communications_url = f"{base_url}/communications"
+            logger.info(f"🌐 TRYING API URL: {communications_url}")
+            try:
+                response = self.session.get(communications_url, params=params, timeout=30) 
+                response.raise_for_status()
+                
+                data = response.json()
+                communications = data.get('data', [])
+                
+                next_before_oid = None
+                if 'meta' in data and 'paging' in data['meta']:
+                    next_before_oid = data['meta']['paging'].get('previousId')
+                
+                logger.info(f"✅ SUCCESS WITH {base_url} - GOT {len(communications)} COMMUNICATIONS")
+                return communications, next_before_oid
                     
-            logger.info(f"✅ RETURNING {len(new_calls)} NEW CALLS FOR PROCESSING")
-            logger.info(f"🔄 TOTAL PROCESSED CALLS SO FAR: {len(self.processed_calls)}")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"❌ FAILED {base_url}: {e}")
+                if e.response is not None:
+                    logger.warning(f"Response: {e.response.status_code} - {e.response.text[:300]}")
+                continue
+        
+        logger.error("💥 FAILED ALL API URLS!")
+        return [], None
+
+    def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
+        """
+        Fetches a single page of communications.
+        Returns (list_of_communications, next_before_oid_for_paging).
+        """
+        params = {'limit': limit}
+        if until_date:
+            params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
+        if before_oid:
+            params['before'] = before_oid
+
+        base_urls_to_try = [
+            self.xelion_base_url,  
+            self.xelion_base_url.replace('/wasteking', '/master'), 
+            'https://lvsl01.xelion.com/api/v1/master', 
+        ]
+        
+        for base_url in base_urls_to_try:
+            communications_url = f"{base_url}/communications"
+            try:
+                response = self.session.get(communications_url, params=params, timeout=30) 
+                response.raise_for_status()
+                
+                data = response.json()
+                communications = data.get('data', [])
+                
+                next_before_oid = None
+                if 'meta' in data and 'paging' in data['meta']:
+                    next_before_oid = data['meta']['paging'].get('previousId')
+                
+                return communications, next_before_oid
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to fetch communications page from {base_url}: {e}")
+                if e.response is not None:
+                    logger.error(f"Response status: {e.response.status_code}, Response: {e.response.text[:300]}")
+                continue
+        
+        logger.error("Failed to fetch any communications page from all attempted URLs.")
+        return [], None
+
+    def download_audio(self, communication_oid: str) -> Optional[str]:
+        """Download audio file for a communication and save it to a designated folder."""
+        audio_url = f"{self.xelion_base_url}/communications/{communication_oid}/audio"
+        
+        file_name = f"{communication_oid}.mp3"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+        temp_file.close()
+        file_path = temp_file.name
+
+        try:
+            response = self.session.get(audio_url, timeout=60) 
             
-            return new_calls
-            
-        except Exception as e:
-            logger.error(f"❌ FAILED TO FETCH CALLS FROM XELION: {e}")
-            import traceback
-            logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
-            return []
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"🎵 DOWNLOADED AUDIO: {communication_oid} ({len(response.content)} bytes)")
+                return file_path
+            elif response.status_code == 404:
+                logger.warning(f"❌ NO AUDIO AVAILABLE: {communication_oid}")
+                return None
+            else:
+                logger.error(f"Failed to download audio for {communication_oid}: {response.status_code} - {response.text[:200]}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Audio download failed for {communication_oid}: {e}")
+            return None
 
     def download_audio(self, call_id: str) -> Optional[str]:
         """Download audio file temporarily"""
@@ -293,7 +419,7 @@ class LiveCallMonitor:
         - category (support, sales, complaint, inquiry, booking, cancellation, other)
         - sentiment (positive, negative, neutral, mixed)
         - priority (1=low, 2=medium, 3=high, 4=urgent)
-        - summary (20-30 words exactly)
+        - summary (exactly 3 lines, 30 words total - 10 words per line)
         - call_outcome (success, failure, partial_success, unknown)
         - overall_score (average of all 18 KPIs)
         
@@ -328,17 +454,17 @@ class LiveCallMonitor:
                 kpi_scores = [result.get(field, 5.0) for field in kpi_fields]
                 result['overall_score'] = round(sum(kpi_scores) / len(kpi_scores), 1)
             
-            logger.info(f"Successfully analyzed call {call_id} with 18 KPIs")
+            logger.info(f"🧠 ANALYZED CALL {call_id} WITH 18 KPIs")
             return result
             
         except Exception as e:
-            logger.error(f"Call analysis failed for {call_id}: {e}")
+            logger.error(f"❌ CALL ANALYSIS FAILED: {call_id}: {e}")
             # Return default scores for all 18 KPIs
             default_result = {
                 "category": "other",
                 "sentiment": "neutral",
                 "priority": 2,
-                "summary": "Call analysis failed - manual review required",
+                "summary": "Call analysis failed.\nManual review required.\nCheck transcript manually.",
                 "call_outcome": "unknown",
                 "overall_score": 5.0
             }
@@ -504,24 +630,16 @@ class LiveCallMonitor:
         
         while self.is_monitoring:
             try:
-                # Clean up old processed calls every hour
-                now = datetime.now()
-                if (now - self.last_cleanup).total_seconds() > 3600:  # 1 hour
-                    logger.info("🧹 CLEANING UP OLD PROCESSED CALLS...")
-                    self.processed_calls.clear()
-                    self.last_cleanup = now
-                    logger.info(f"✅ CLEARED PROCESSED CALLS LIST")
-                
                 # Check if we're still logged in
                 if not self.session_token:
                     logger.warning("🔑 NO SESSION TOKEN - ATTEMPTING LOGIN...")
-                    if not self.login():
+                    if not self.login(self._xelion_username):
                         logger.error("❌ LOGIN FAILED - RETRYING IN 60s")
                         time.sleep(60)
                         continue
                 
                 logger.info("🔍 CHECKING FOR NEW CALLS...")
-                recent_calls = self.get_recent_calls(minutes_back=15)  # Increased to 15 minutes
+                recent_calls = self.get_recent_calls(minutes_back=10)  # Check last 10 minutes
                 
                 logger.info(f"📊 FOUND {len(recent_calls)} NEW CALLS")
                 
@@ -545,7 +663,7 @@ class LiveCallMonitor:
                 
                 # Try to re-login on error
                 logger.info("🔄 ATTEMPTING RE-LOGIN AFTER ERROR...")
-                self.login()
+                self.login(self._xelion_username)
                 
                 time.sleep(60)  # Wait longer on error
 
@@ -565,7 +683,7 @@ def get_calls():
     cursor = conn.cursor()
     
     cursor.execute('''
-        SELECT call_id, timestamp, duration, transcript, category, summary, sentiment, priority, call_outcome, overall_score,
+        SELECT call_id, timestamp, duration, transcript, category, summary, sentiment, priority, call_outcome, overall_score, agent_id,
                call_success_rate, first_call_resolution, issue_identification, solution_effectiveness,
                customer_satisfaction, user_interaction_sentiment, customer_effort_score, wait_time_satisfaction,
                communication_clarity, listening_skills, empathy_emotional_intelligence, product_service_knowledge,
@@ -589,33 +707,34 @@ def get_calls():
             'priority': row[7],
             'call_outcome': row[8],
             'overall_score': row[9],
-            'processed_at': row[28],
+            'agent_id': row[10],
+            'processed_at': row[29],
             'kpis': {
                 # Call Success & Resolution
-                'call_success_rate': row[10],
-                'first_call_resolution': row[11],
-                'issue_identification': row[12],
-                'solution_effectiveness': row[13],
+                'call_success_rate': row[11],
+                'first_call_resolution': row[12],
+                'issue_identification': row[13],
+                'solution_effectiveness': row[14],
                 
                 # Customer Experience
-                'customer_satisfaction': row[14],
-                'user_interaction_sentiment': row[15],
-                'customer_effort_score': row[16],
-                'wait_time_satisfaction': row[17],
+                'customer_satisfaction': row[15],
+                'user_interaction_sentiment': row[16],
+                'customer_effort_score': row[17],
+                'wait_time_satisfaction': row[18],
                 
                 # Agent Performance
-                'communication_clarity': row[18],
-                'listening_skills': row[19],
-                'empathy_emotional_intelligence': row[20],
-                'product_service_knowledge': row[21],
-                'call_control_flow': row[22],
-                'professionalism_courtesy': row[23],
+                'communication_clarity': row[19],
+                'listening_skills': row[20],
+                'empathy_emotional_intelligence': row[21],
+                'product_service_knowledge': row[22],
+                'call_control_flow': row[23],
+                'professionalism_courtesy': row[24],
                 
                 # Operational Efficiency
-                'call_handling_efficiency': row[24],
-                'information_gathering': row[25],
-                'follow_up_commitment': row[26],
-                'compliance_adherence': row[27]
+                'call_handling_efficiency': row[25],
+                'information_gathering': row[26],
+                'follow_up_commitment': row[27],
+                'compliance_adherence': row[28]
             }
         })
     
