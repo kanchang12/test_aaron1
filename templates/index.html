@@ -632,6 +632,7 @@
                             <div class="call-meta">
                                 ${new Date(call.timestamp).toLocaleString()} • 
                                 Duration: ${Math.round(call.duration || 0)}s •
+                                Agent: ${call.agent_id || 'Unknown'} •
                                 Score: ${(call.overall_score || 0).toFixed(1)}/10
                             </div>
                         </div>
@@ -649,7 +650,8 @@
                     </div>
                     
                     <div class="summary">
-                        <strong>Summary:</strong> ${call.summary}
+                        <strong>Summary:</strong><br>
+                        ${(call.summary || '').replace(/\n/g, '<br>')}
                     </div>
 
                     ${call.kpis ? `
