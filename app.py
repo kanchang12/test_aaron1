@@ -16,8 +16,6 @@ import logging
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Suppress HTTP request logs
 logging.getLogger('geventwebsocket.handler').setLevel(logging.WARNING)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
@@ -27,40 +25,29 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 class LiveCallMonitor:
     def __init__(self):
-        # API Configuration
         self.xelion_base_url = os.environ.get('XELION_BASE_URL', 'https://lvsl01.xelion.com/api/v1/wasteking')
         self._xelion_username = os.environ.get('XELION_USERNAME', 'abi.housego@wasteking.co.uk')
         self.xelion_password = os.environ.get('XELION_PASSWORD', 'Passw0rd#')
         self.xelion_app_key = os.environ.get('XELION_APP_KEY', 'NtYFnwKdrqbuXAd4N88txxnim2Nd6LnE')
         self.userspace = os.environ.get('XELION_USERSPACE', None)
         
-        # AI API keys
         self.openai_api_key = os.environ.get('OPENAI_API_KEY')
         self.deepgram_api_key = os.environ.get('DEEPGRAM_API_KEY')
         
-        # Initialize clients
         self.openai_client = OpenAI(api_key=self.openai_api_key)
         self.deepgram = DeepgramClient(self.deepgram_api_key)
         
-        # Session management
         self.session = requests.Session()
         self.session_token = None
-        
-        # Tracking
         self.processed_calls = set()
         self.is_monitoring = False
         
-        # Initialize database
         self.init_database()
-        
-        # Login to Xelion
-        self.login(self._xelion_username)
+        self.login()
 
     def init_database(self):
-        """Initialize SQLite database for storing call data with 18 KPIs"""
         conn = sqlite3.connect('calls.db')
         cursor = conn.cursor()
-        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,59 +62,41 @@ class LiveCallMonitor:
                 call_outcome TEXT,
                 overall_score REAL,
                 agent_id TEXT,
-                
-                -- Call Success & Resolution KPIs
                 call_success_rate REAL,
                 first_call_resolution REAL,
                 issue_identification REAL,
                 solution_effectiveness REAL,
-                
-                -- Customer Experience KPIs
                 customer_satisfaction REAL,
                 user_interaction_sentiment REAL,
                 customer_effort_score REAL,
                 wait_time_satisfaction REAL,
-                
-                -- Agent Performance KPIs
                 communication_clarity REAL,
                 listening_skills REAL,
                 empathy_emotional_intelligence REAL,
                 product_service_knowledge REAL,
                 call_control_flow REAL,
                 professionalism_courtesy REAL,
-                
-                -- Operational Efficiency KPIs
                 call_handling_efficiency REAL,
                 information_gathering REAL,
                 follow_up_commitment REAL,
                 compliance_adherence REAL,
-                
                 processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
         conn.commit()
         conn.close()
 
     def _get_userspace_for_login(self, current_username: str) -> str:
-        """Determines the userspace to use for a given username during login."""
         if self.userspace:
             return self.userspace
         return f"transcriber-{current_username.split('@')[0].replace('.', '-')}" 
 
     def login(self, username_to_login: str = None) -> bool:
-        """
-        Authenticate with Xelion using the provided username (or self._xelion_username)
-        and obtain a session token.
-        """
         if username_to_login is None:
             username_to_login = self._xelion_username
         
         login_url = f"{self.xelion_base_url}/me/login"
-        headers = {
-            "Content-Type": "application/json"
-        }
-        
+        headers = {"Content-Type": "application/json"}
         current_userspace = self._get_userspace_for_login(username_to_login)
 
         data_payload = { 
@@ -136,34 +105,22 @@ class LiveCallMonitor:
             "userSpace": current_userspace,     
             "appKey": self.xelion_app_key
         }
-        
-        json_data_string = json.dumps(data_payload)
-        
-        logger.info(f"🔑 ATTEMPTING LOGIN: {username_to_login}")
-        
+
         try:
-            response = self.session.post(login_url, headers=headers, data=json_data_string)
+            response = self.session.post(login_url, headers=headers, data=json.dumps(data_payload))
             response.raise_for_status() 
             
             login_response = response.json()
             self.session_token = login_response.get("authentication")
             self.session.headers.update({"Authorization": f"xelion {self.session_token}"})
             
-            valid_until = login_response.get('validUntil', 'N/A')
-            logger.info(f"✅ LOGIN SUCCESS: {username_to_login} (Valid until: {valid_until})")
+            logger.info(f"✅ LOGIN SUCCESS: {username_to_login}")
             return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ LOGIN FAILED: {username_to_login}: {e}")
-            if e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}")
-                logger.error(f"Response: {e.response.text}")
+        except Exception as e:
+            logger.error(f"❌ LOGIN FAILED: {e}")
             return False
 
     def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
-        """
-        Fetches a single page of communications.
-        Returns (list_of_communications, next_before_oid_for_paging).
-        """
         params = {'limit': limit}
         if until_date:
             params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
@@ -192,45 +149,12 @@ class LiveCallMonitor:
                 return communications, next_before_oid
                     
             except requests.exceptions.RequestException as e:
-                logger.error(f"Failed to fetch communications page from {base_url}: {e}")
-                if e.response is not None:
-                    logger.error(f"Response status: {e.response.status_code}, Response: {e.response.text[:300]}")
                 continue
         
-        logger.error("Failed to fetch any communications page from all attempted URLs.")
         return [], None
 
-    def get_recent_calls(self, minutes_back: int = 10) -> List[Dict]:
-        """Get recent calls using the working API method"""
-        until_date = datetime.now()
-        
-        logger.info(f"🔍 FETCHING ALL COMMUNICATIONS...")
-        
-        communications, _ = self._fetch_communications_page(
-            limit=50, 
-            until_date=until_date
-        )
-        
-        logger.info(f"📞 GOT {len(communications)} COMMUNICATIONS FROM API")
-        
-        # Process ALL calls - no filtering
-        new_calls = []
-        for comm in communications:
-            comm_obj = comm.get('object', {})
-            call_id = comm_obj.get('oid')
-            
-            if call_id:
-                new_calls.append(comm_obj)
-                logger.info(f"🆕 CALL FOUND: {call_id}")
-                
-        logger.info(f"✅ RETURNING {len(new_calls)} CALLS FOR PROCESSING")
-        return new_calls
-
     def download_audio(self, communication_oid: str) -> Optional[str]:
-        """Download audio file for a communication and save it to a designated folder."""
         audio_url = f"{self.xelion_base_url}/communications/{communication_oid}/audio"
-        
-        file_name = f"{communication_oid}.mp3"
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
         temp_file.close()
         file_path = temp_file.name
@@ -241,27 +165,19 @@ class LiveCallMonitor:
             if response.status_code == 200:
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
-                logger.info(f"🎵 DOWNLOADED AUDIO: {communication_oid} ({len(response.content)} bytes)")
+                logger.info(f"🎵 DOWNLOADED AUDIO: {communication_oid}")
                 return file_path
-            elif response.status_code == 404:
-                logger.warning(f"❌ NO AUDIO AVAILABLE: {communication_oid}")
-                return None
             else:
-                logger.error(f"Failed to download audio for {communication_oid}: {response.status_code} - {response.text[:200]}")
                 return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Audio download failed for {communication_oid}: {e}")
+        except:
             return None
 
     def transcribe_audio(self, audio_file_path: str, call_id: str) -> Optional[str]:
-        """Transcribe audio using Deepgram"""
         try:
             with open(audio_file_path, 'rb') as audio_file:
                 buffer_data = audio_file.read()
 
             payload = {'buffer': buffer_data}
-            
             options = PrerecordedOptions(
                 model="nova-2",
                 smart_format=True,
@@ -278,7 +194,7 @@ class LiveCallMonitor:
                     speaker = f"Speaker {utterance.speaker}"
                     transcript += f"{speaker}: {utterance.transcript}\n"
             
-            logger.info(f"🎙️ TRANSCRIBED CALL: {call_id}")
+            logger.info(f"🎙️ TRANSCRIBED: {call_id}")
             return transcript.strip()
             
         except Exception as e:
@@ -286,7 +202,6 @@ class LiveCallMonitor:
             return None
 
     def analyze_call(self, transcript: str, call_id: str) -> Dict:
-        """Analyze call using GPT-4.0-mini with comprehensive 18 KPI system"""
         prompt = """
         Analyze this call transcript and provide comprehensive evaluation across 18 KPIs organized in 4 categories.
         Rate each KPI from 0.0 to 10.0 (one decimal place).
@@ -343,7 +258,6 @@ class LiveCallMonitor:
             
             result = json.loads(response.choices[0].message.content)
             
-            # Calculate overall score if not provided
             kpi_fields = [
                 'call_success_rate', 'first_call_resolution', 'issue_identification', 'solution_effectiveness',
                 'customer_satisfaction', 'user_interaction_sentiment', 'customer_effort_score', 'wait_time_satisfaction',
@@ -356,76 +270,64 @@ class LiveCallMonitor:
                 kpi_scores = [result.get(field, 5.0) for field in kpi_fields]
                 result['overall_score'] = round(sum(kpi_scores) / len(kpi_scores), 1)
             
-            logger.info(f"🧠 ANALYZED CALL {call_id} WITH 18 KPIs")
+            logger.info(f"🧠 ANALYZED: {call_id}")
             return result
             
         except Exception as e:
-            logger.error(f"❌ CALL ANALYSIS FAILED: {call_id}: {e}")
-            # Return default scores for all 18 KPIs
+            logger.error(f"❌ ANALYSIS FAILED: {call_id}: {e}")
             default_result = {
-                "category": "other",
-                "sentiment": "neutral",
-                "priority": 2,
+                "category": "other", "sentiment": "neutral", "priority": 2,
                 "summary": "Call analysis failed.\nManual review required.\nCheck transcript manually.",
-                "call_outcome": "unknown",
-                "overall_score": 5.0
+                "call_outcome": "unknown", "overall_score": 5.0
             }
             
-            # Add all 18 KPIs with default scores
-            kpi_defaults = [
+            for kpi in [
                 'call_success_rate', 'first_call_resolution', 'issue_identification', 'solution_effectiveness',
                 'customer_satisfaction', 'user_interaction_sentiment', 'customer_effort_score', 'wait_time_satisfaction',
                 'communication_clarity', 'listening_skills', 'empathy_emotional_intelligence', 'product_service_knowledge',
                 'call_control_flow', 'professionalism_courtesy', 'call_handling_efficiency', 'information_gathering',
                 'follow_up_commitment', 'compliance_adherence'
-            ]
-            
-            for kpi in kpi_defaults:
+            ]:
                 default_result[kpi] = 5.0
                 
             return default_result
 
     def process_call(self, call_data: Dict):
-        """Complete call processing pipeline"""
         call_id = call_data.get('oid')
-        if not call_id:
+        if not call_id or call_id in self.processed_calls:
             return
             
-        logger.info(f"🎯 PROCESSING CALL: {call_id}")
+        self.processed_calls.add(call_id)
+        logger.info(f"🎯 PROCESSING: {call_id}")
         
-        # Extract metadata
         agent_id = call_data.get('agentId', 'Unknown')
         duration = call_data.get('duration', 0)
         call_date = call_data.get('date', datetime.now().isoformat())
         
         try:
             # Download audio
-            logger.info(f"🎵 DOWNLOADING AUDIO: {call_id}")
             audio_file = self.download_audio(call_id)
             if not audio_file:
-                logger.warning(f"❌ NO AUDIO AVAILABLE: {call_id}")
+                logger.warning(f"❌ NO AUDIO: {call_id}")
                 return
             
             # Transcribe
-            logger.info(f"🎙️  TRANSCRIBING AUDIO: {call_id}")
             transcript = self.transcribe_audio(audio_file, call_id)
             
-            # Clean up audio file immediately
+            # Delete audio immediately
             try:
                 os.unlink(audio_file)
-                logger.info(f"🗑️  AUDIO DELETED: {call_id}")
+                logger.info(f"🗑️ DELETED AUDIO: {call_id}")
             except Exception as e:
-                logger.error(f"❌ FAILED TO DELETE AUDIO: {call_id} - {e}")
+                logger.error(f"❌ DELETE FAILED: {call_id}")
                 
             if not transcript:
-                logger.warning(f"❌ TRANSCRIPTION FAILED: {call_id}")
                 return
             
             # Analyze
-            logger.info(f"🧠 ANALYZING CALL: {call_id}")
             analysis = self.analyze_call(transcript, call_id)
             
-            # Store in database with all 18 KPIs
+            # Store in database
             conn = sqlite3.connect('calls.db')
             cursor = conn.cursor()
             
@@ -439,143 +341,75 @@ class LiveCallMonitor:
                  follow_up_commitment, compliance_adherence)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                call_id,
-                call_date,
-                duration,
-                transcript,
-                analysis.get('category', 'other'),
-                analysis.get('summary', ''),
-                analysis.get('sentiment', 'neutral'),
-                analysis.get('priority', 2),
-                analysis.get('call_outcome', 'unknown'),
-                analysis.get('overall_score', 5.0),
-                agent_id,
-                
-                # Call Success & Resolution
-                analysis.get('call_success_rate', 5.0),
-                analysis.get('first_call_resolution', 5.0),
-                analysis.get('issue_identification', 5.0),
-                analysis.get('solution_effectiveness', 5.0),
-                
-                # Customer Experience
-                analysis.get('customer_satisfaction', 5.0),
-                analysis.get('user_interaction_sentiment', 5.0),
-                analysis.get('customer_effort_score', 5.0),
-                analysis.get('wait_time_satisfaction', 5.0),
-                
-                # Agent Performance
-                analysis.get('communication_clarity', 5.0),
-                analysis.get('listening_skills', 5.0),
-                analysis.get('empathy_emotional_intelligence', 5.0),
-                analysis.get('product_service_knowledge', 5.0),
-                analysis.get('call_control_flow', 5.0),
-                analysis.get('professionalism_courtesy', 5.0),
-                
-                # Operational Efficiency
-                analysis.get('call_handling_efficiency', 5.0),
-                analysis.get('information_gathering', 5.0),
-                analysis.get('follow_up_commitment', 5.0),
-                analysis.get('compliance_adherence', 5.0)
+                call_id, call_date, duration, transcript,
+                analysis.get('category', 'other'), analysis.get('summary', ''), 
+                analysis.get('sentiment', 'neutral'), analysis.get('priority', 2),
+                analysis.get('call_outcome', 'unknown'), analysis.get('overall_score', 5.0), agent_id,
+                analysis.get('call_success_rate', 5.0), analysis.get('first_call_resolution', 5.0),
+                analysis.get('issue_identification', 5.0), analysis.get('solution_effectiveness', 5.0),
+                analysis.get('customer_satisfaction', 5.0), analysis.get('user_interaction_sentiment', 5.0),
+                analysis.get('customer_effort_score', 5.0), analysis.get('wait_time_satisfaction', 5.0),
+                analysis.get('communication_clarity', 5.0), analysis.get('listening_skills', 5.0),
+                analysis.get('empathy_emotional_intelligence', 5.0), analysis.get('product_service_knowledge', 5.0),
+                analysis.get('call_control_flow', 5.0), analysis.get('professionalism_courtesy', 5.0),
+                analysis.get('call_handling_efficiency', 5.0), analysis.get('information_gathering', 5.0),
+                analysis.get('follow_up_commitment', 5.0), analysis.get('compliance_adherence', 5.0)
             ))
             
             conn.commit()
             conn.close()
             
-            # Emit real-time update with all KPIs
+            # Broadcast to dashboard
             call_result = {
-                'call_id': call_id,
-                'timestamp': call_date,
-                'duration': duration,
-                'transcript': transcript,
-                'category': analysis.get('category', 'other'),
-                'summary': analysis.get('summary', ''),
-                'sentiment': analysis.get('sentiment', 'neutral'),
-                'priority': analysis.get('priority', 2),
-                'call_outcome': analysis.get('call_outcome', 'unknown'),
-                'overall_score': analysis.get('overall_score', 5.0),
-                'agent_id': agent_id,
-                'kpis': {
-                    # Call Success & Resolution
-                    'call_success_rate': analysis.get('call_success_rate', 5.0),
-                    'first_call_resolution': analysis.get('first_call_resolution', 5.0),
-                    'issue_identification': analysis.get('issue_identification', 5.0),
-                    'solution_effectiveness': analysis.get('solution_effectiveness', 5.0),
-                    
-                    # Customer Experience
-                    'customer_satisfaction': analysis.get('customer_satisfaction', 5.0),
-                    'user_interaction_sentiment': analysis.get('user_interaction_sentiment', 5.0),
-                    'customer_effort_score': analysis.get('customer_effort_score', 5.0),
-                    'wait_time_satisfaction': analysis.get('wait_time_satisfaction', 5.0),
-                    
-                    # Agent Performance
-                    'communication_clarity': analysis.get('communication_clarity', 5.0),
-                    'listening_skills': analysis.get('listening_skills', 5.0),
-                    'empathy_emotional_intelligence': analysis.get('empathy_emotional_intelligence', 5.0),
-                    'product_service_knowledge': analysis.get('product_service_knowledge', 5.0),
-                    'call_control_flow': analysis.get('call_control_flow', 5.0),
-                    'professionalism_courtesy': analysis.get('professionalism_courtesy', 5.0),
-                    
-                    # Operational Efficiency
-                    'call_handling_efficiency': analysis.get('call_handling_efficiency', 5.0),
-                    'information_gathering': analysis.get('information_gathering', 5.0),
-                    'follow_up_commitment': analysis.get('follow_up_commitment', 5.0),
-                    'compliance_adherence': analysis.get('compliance_adherence', 5.0)
-                }
+                'call_id': call_id, 'timestamp': call_date, 'duration': duration,
+                'transcript': transcript, 'category': analysis.get('category', 'other'),
+                'summary': analysis.get('summary', ''), 'sentiment': analysis.get('sentiment', 'neutral'),
+                'priority': analysis.get('priority', 2), 'call_outcome': analysis.get('call_outcome', 'unknown'),
+                'overall_score': analysis.get('overall_score', 5.0), 'agent_id': agent_id,
+                'kpis': {k: analysis.get(k, 5.0) for k in [
+                    'call_success_rate', 'first_call_resolution', 'issue_identification', 'solution_effectiveness',
+                    'customer_satisfaction', 'user_interaction_sentiment', 'customer_effort_score', 'wait_time_satisfaction',
+                    'communication_clarity', 'listening_skills', 'empathy_emotional_intelligence', 'product_service_knowledge',
+                    'call_control_flow', 'professionalism_courtesy', 'call_handling_efficiency', 'information_gathering',
+                    'follow_up_commitment', 'compliance_adherence'
+                ]}
             }
             
             socketio.emit('new_call', call_result)
-            logger.info(f"✅ CALL PROCESSED & BROADCASTED: {call_id}")
+            logger.info(f"✅ COMPLETED: {call_id}")
             
         except Exception as e:
-            logger.error(f"❌ ERROR PROCESSING CALL {call_id}: {e}")
-            import traceback
-            logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
+            logger.error(f"❌ ERROR: {call_id}: {e}")
 
     def start_monitoring(self):
-        """Start monitoring for new calls"""
         self.is_monitoring = True
-        logger.info("🎯 STARTING LIVE CALL MONITORING...")
+        logger.info("🎯 STARTING LIVE MONITORING...")
         
         while self.is_monitoring:
             try:
-                # Check if we're still logged in
                 if not self.session_token:
-                    logger.warning("🔑 NO SESSION TOKEN - ATTEMPTING LOGIN...")
-                    if not self.login(self._xelion_username):
-                        logger.error("❌ LOGIN FAILED - RETRYING IN 60s")
-                        time.sleep(60)
-                        continue
+                    self.login()
                 
-                logger.info("🔍 CHECKING FOR NEW CALLS...")
-                recent_calls = self.get_recent_calls(minutes_back=10)  # Check last 10 minutes
+                communications, _ = self._fetch_communications_page(100, datetime.now())
                 
-                logger.info(f"📊 FOUND {len(recent_calls)} NEW CALLS")
-                
-                if len(recent_calls) == 0:
-                    logger.info("💤 NO NEW CALLS FOUND - SLEEPING 30s")
+                if communications:
+                    logger.info(f"📞 FOUND {len(communications)} COMMUNICATIONS")
+                    for comm in communications:
+                        comm_obj = comm.get('object', {})
+                        if comm_obj.get('oid'):
+                            thread = threading.Thread(target=self.process_call, args=(comm_obj,))
+                            thread.daemon = True
+                            thread.start()
                 else:
-                    logger.info(f"🚀 PROCESSING {len(recent_calls)} CALLS")
+                    logger.info("💤 NO CALLS FOUND")
                 
-                for call_data in recent_calls:
-                    # Process each call in a separate thread
-                    thread = threading.Thread(target=self.process_call, args=(call_data,))
-                    thread.daemon = True
-                    thread.start()
-                
-                time.sleep(30)  # Check every 30 seconds
+                time.sleep(30)
                 
             except Exception as e:
-                logger.error(f"❌ ERROR IN MONITORING: {e}")
-                import traceback
-                logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
-                
-                # Try to re-login on error
-                logger.info("🔄 ATTEMPTING RE-LOGIN AFTER ERROR...")
-                self.login(self._xelion_username)
-                
-                time.sleep(60)  # Wait longer on error
+                logger.error(f"❌ MONITORING ERROR: {e}")
+                self.login()
+                time.sleep(60)
 
-# Initialize monitor
 monitor = LiveCallMonitor()
 
 @app.route('/')
@@ -584,9 +418,7 @@ def index():
 
 @app.route('/api/calls')
 def get_calls():
-    """Get recent calls from database with all KPIs"""
     limit = request.args.get('limit', 20, type=int)
-    
     conn = sqlite3.connect('calls.db')
     cursor = conn.cursor()
     
@@ -597,52 +429,21 @@ def get_calls():
                communication_clarity, listening_skills, empathy_emotional_intelligence, product_service_knowledge,
                call_control_flow, professionalism_courtesy, call_handling_efficiency, information_gathering,
                follow_up_commitment, compliance_adherence, processed_at
-        FROM calls 
-        ORDER BY processed_at DESC 
-        LIMIT ?
+        FROM calls ORDER BY processed_at DESC LIMIT ?
     ''', (limit,))
     
     calls = []
     for row in cursor.fetchall():
         calls.append({
-            'call_id': row[0],
-            'timestamp': row[1],
-            'duration': row[2],
-            'transcript': row[3],
-            'category': row[4],
-            'summary': row[5],
-            'sentiment': row[6],
-            'priority': row[7],
-            'call_outcome': row[8],
-            'overall_score': row[9],
-            'agent_id': row[10],
-            'processed_at': row[29],
+            'call_id': row[0], 'timestamp': row[1], 'duration': row[2], 'transcript': row[3],
+            'category': row[4], 'summary': row[5], 'sentiment': row[6], 'priority': row[7],
+            'call_outcome': row[8], 'overall_score': row[9], 'agent_id': row[10], 'processed_at': row[29],
             'kpis': {
-                # Call Success & Resolution
-                'call_success_rate': row[11],
-                'first_call_resolution': row[12],
-                'issue_identification': row[13],
-                'solution_effectiveness': row[14],
-                
-                # Customer Experience
-                'customer_satisfaction': row[15],
-                'user_interaction_sentiment': row[16],
-                'customer_effort_score': row[17],
-                'wait_time_satisfaction': row[18],
-                
-                # Agent Performance
-                'communication_clarity': row[19],
-                'listening_skills': row[20],
-                'empathy_emotional_intelligence': row[21],
-                'product_service_knowledge': row[22],
-                'call_control_flow': row[23],
-                'professionalism_courtesy': row[24],
-                
-                # Operational Efficiency
-                'call_handling_efficiency': row[25],
-                'information_gathering': row[26],
-                'follow_up_commitment': row[27],
-                'compliance_adherence': row[28]
+                'call_success_rate': row[11], 'first_call_resolution': row[12], 'issue_identification': row[13], 'solution_effectiveness': row[14],
+                'customer_satisfaction': row[15], 'user_interaction_sentiment': row[16], 'customer_effort_score': row[17], 'wait_time_satisfaction': row[18],
+                'communication_clarity': row[19], 'listening_skills': row[20], 'empathy_emotional_intelligence': row[21], 'product_service_knowledge': row[22],
+                'call_control_flow': row[23], 'professionalism_courtesy': row[24], 'call_handling_efficiency': row[25], 'information_gathering': row[26],
+                'follow_up_commitment': row[27], 'compliance_adherence': row[28]
             }
         })
     
@@ -651,11 +452,9 @@ def get_calls():
 
 @app.route('/api/stats')
 def get_stats():
-    """Get dashboard statistics with KPI averages"""
     conn = sqlite3.connect('calls.db')
     cursor = conn.cursor()
     
-    # Get basic counts
     cursor.execute('SELECT COUNT(*) FROM calls')
     total_calls = cursor.fetchone()[0]
     
@@ -671,13 +470,9 @@ def get_stats():
     cursor.execute('SELECT AVG(duration) FROM calls WHERE duration > 0')
     avg_duration = cursor.fetchone()[0] or 0
     
-    cursor.execute('SELECT AVG(priority) FROM calls')
-    avg_priority = cursor.fetchone()[0] or 0
-    
     cursor.execute('SELECT AVG(overall_score) FROM calls')
     avg_overall_score = cursor.fetchone()[0] or 0
     
-    # Get KPI averages
     kpi_fields = [
         'call_success_rate', 'first_call_resolution', 'issue_identification', 'solution_effectiveness',
         'customer_satisfaction', 'user_interaction_sentiment', 'customer_effort_score', 'wait_time_satisfaction',
@@ -699,7 +494,6 @@ def get_stats():
         'sentiment_counts': sentiment_counts,
         'outcome_counts': outcome_counts,
         'avg_duration': round(avg_duration, 1),
-        'avg_priority': round(avg_priority, 1),
         'avg_overall_score': round(avg_overall_score, 1),
         'kpi_averages': {k: round(v, 1) for k, v in kpi_averages.items()},
         'successful_calls': outcome_counts.get('success', 0),
@@ -712,28 +506,18 @@ def get_stats():
 
 @socketio.on('connect')
 def handle_connect():
-    logger.info('Client connected to WebSocket')
     emit('status', {'status': 'connected'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    logger.info('Client disconnected from WebSocket')
+    pass
 
 def start_background_monitoring():
-    """Start monitoring in background thread"""
-    logger.info("🚀 STARTING BACKGROUND MONITORING THREAD...")
     monitor_thread = threading.Thread(target=monitor.start_monitoring)
     monitor_thread.daemon = True
     monitor_thread.start()
-    logger.info("✅ BACKGROUND MONITORING THREAD STARTED")
 
 if __name__ == '__main__':
-    logger.info("🎯 INITIALIZING LIVE CALL MONITOR...")
-    
-    # Start background monitoring
     start_background_monitoring()
-    
-    logger.info("🌐 STARTING FLASK WEB SERVER...")
-    # Run Flask app
     port = int(os.environ.get('PORT', 5000))
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
