@@ -1,7 +1,14 @@
 Flask
 Flask-SocketIO
-requests
+python-dotenv
+twilio
 openai
+elevenlabs
+websockets>=12.0,<13.0  # Added an upper bound for stability
+aiohttp>=3.9,<4.0      # Added an upper bound for stability
+gunicorn
+gevent
+gevent-websocket
 deepgram-sdk
 schedule
 gunicorn
