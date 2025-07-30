@@ -1,19 +1,4 @@
-def download_audio(self, communication_oid: str) -> Optional[str]:
-        """Download audio file for a communication and save it to a designated folder."""
-        audio_url = f"{self.xelion_base_url}/communications/{communication_oid}/audio"
-        
-        file_name = f"{communication_oid}.mp3"
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-        temp_file.close()
-        file_path = temp_file.name
-
-        try:
-            response = self.session.get(audio_url, timeout=60) 
-            
-            if response.status_code == 200:
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
-                logger.info(from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 import requests
 import json
@@ -22,11 +7,10 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import tempfile
 from openai import OpenAI
 from deepgram import DeepgramClient, PrerecordedOptions
-import schedule
 import logging
 
 # Configure logging
@@ -175,6 +159,47 @@ class LiveCallMonitor:
                 logger.error(f"Response: {e.response.text}")
             return False
 
+    def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
+        """
+        Fetches a single page of communications.
+        Returns (list_of_communications, next_before_oid_for_paging).
+        """
+        params = {'limit': limit}
+        if until_date:
+            params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
+        if before_oid:
+            params['before'] = before_oid
+
+        base_urls_to_try = [
+            self.xelion_base_url,  
+            self.xelion_base_url.replace('/wasteking', '/master'), 
+            'https://lvsl01.xelion.com/api/v1/master', 
+        ]
+        
+        for base_url in base_urls_to_try:
+            communications_url = f"{base_url}/communications"
+            try:
+                response = self.session.get(communications_url, params=params, timeout=30) 
+                response.raise_for_status()
+                
+                data = response.json()
+                communications = data.get('data', [])
+                
+                next_before_oid = None
+                if 'meta' in data and 'paging' in data['meta']:
+                    next_before_oid = data['meta']['paging'].get('previousId')
+                
+                return communications, next_before_oid
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to fetch communications page from {base_url}: {e}")
+                if e.response is not None:
+                    logger.error(f"Response status: {e.response.status_code}, Response: {e.response.text[:300]}")
+                continue
+        
+        logger.error("Failed to fetch any communications page from all attempted URLs.")
+        return [], None
+
     def get_recent_calls(self, minutes_back: int = 10) -> List[Dict]:
         """Get recent calls using the working API method"""
         until_date = datetime.now()
@@ -217,90 +242,6 @@ class LiveCallMonitor:
         logger.info(f"✅ RETURNING {len(new_calls)} NEW CALLS FOR PROCESSING")
         return new_calls
 
-    def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
-        """
-        Fetches a single page of communications.
-        Returns (list_of_communications, next_before_oid_for_paging).
-        """
-        params = {'limit': limit}
-        if until_date:
-            params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
-        if before_oid:
-            params['before'] = before_oid
-
-        base_urls_to_try = [
-            self.xelion_base_url,  
-            self.xelion_base_url.replace('/wasteking', '/master'), 
-            'https://lvsl01.xelion.com/api/v1/master', 
-        ]
-        
-        for base_url in base_urls_to_try:
-            communications_url = f"{base_url}/communications"
-            logger.info(f"🌐 TRYING API URL: {communications_url}")
-            try:
-                response = self.session.get(communications_url, params=params, timeout=30) 
-                response.raise_for_status()
-                
-                data = response.json()
-                communications = data.get('data', [])
-                
-                next_before_oid = None
-                if 'meta' in data and 'paging' in data['meta']:
-                    next_before_oid = data['meta']['paging'].get('previousId')
-                
-                logger.info(f"✅ SUCCESS WITH {base_url} - GOT {len(communications)} COMMUNICATIONS")
-                return communications, next_before_oid
-                    
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"❌ FAILED {base_url}: {e}")
-                if e.response is not None:
-                    logger.warning(f"Response: {e.response.status_code} - {e.response.text[:300]}")
-                continue
-        
-        logger.error("💥 FAILED ALL API URLS!")
-        return [], None
-
-    def _fetch_communications_page(self, limit: int, until_date: datetime, before_oid: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
-        """
-        Fetches a single page of communications.
-        Returns (list_of_communications, next_before_oid_for_paging).
-        """
-        params = {'limit': limit}
-        if until_date:
-            params['until'] = until_date.strftime('%Y-%m-%d %H:%M:%S') 
-        if before_oid:
-            params['before'] = before_oid
-
-        base_urls_to_try = [
-            self.xelion_base_url,  
-            self.xelion_base_url.replace('/wasteking', '/master'), 
-            'https://lvsl01.xelion.com/api/v1/master', 
-        ]
-        
-        for base_url in base_urls_to_try:
-            communications_url = f"{base_url}/communications"
-            try:
-                response = self.session.get(communications_url, params=params, timeout=30) 
-                response.raise_for_status()
-                
-                data = response.json()
-                communications = data.get('data', [])
-                
-                next_before_oid = None
-                if 'meta' in data and 'paging' in data['meta']:
-                    next_before_oid = data['meta']['paging'].get('previousId')
-                
-                return communications, next_before_oid
-                    
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Failed to fetch communications page from {base_url}: {e}")
-                if e.response is not None:
-                    logger.error(f"Response status: {e.response.status_code}, Response: {e.response.text[:300]}")
-                continue
-        
-        logger.error("Failed to fetch any communications page from all attempted URLs.")
-        return [], None
-
     def download_audio(self, communication_oid: str) -> Optional[str]:
         """Download audio file for a communication and save it to a designated folder."""
         audio_url = f"{self.xelion_base_url}/communications/{communication_oid}/audio"
@@ -329,29 +270,6 @@ class LiveCallMonitor:
             logger.error(f"Audio download failed for {communication_oid}: {e}")
             return None
 
-    def download_audio(self, call_id: str) -> Optional[str]:
-        """Download audio file temporarily"""
-        audio_url = f"{self.xelion_base_url}/communications/{call_id}/audio"
-        
-        try:
-            response = self.session.get(audio_url, timeout=60)
-            
-            if response.status_code == 200:
-                # Create temporary file
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-                temp_file.write(response.content)
-                temp_file.close()
-                
-                logger.info(f"Downloaded audio for call {call_id} ({len(response.content)} bytes)")
-                return temp_file.name
-            else:
-                logger.warning(f"No audio available for call {call_id}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Failed to download audio for {call_id}: {e}")
-            return None
-
     def transcribe_audio(self, audio_file_path: str, call_id: str) -> Optional[str]:
         """Transcribe audio using Deepgram"""
         try:
@@ -376,11 +294,11 @@ class LiveCallMonitor:
                     speaker = f"Speaker {utterance.speaker}"
                     transcript += f"{speaker}: {utterance.transcript}\n"
             
-            logger.info(f"Successfully transcribed call {call_id}")
+            logger.info(f"🎙️ TRANSCRIBED CALL: {call_id}")
             return transcript.strip()
             
         except Exception as e:
-            logger.error(f"Transcription failed for {call_id}: {e}")
+            logger.error(f"❌ TRANSCRIPTION FAILED: {call_id}: {e}")
             return None
 
     def analyze_call(self, transcript: str, call_id: str) -> Dict:
@@ -489,10 +407,15 @@ class LiveCallMonitor:
         if not call_id:
             return
             
-        logger.info(f"Processing call {call_id}")
+        logger.info(f"🎯 PROCESSING CALL: {call_id}")
         
         # Add to processed set immediately to prevent duplicates
         self.processed_calls.add(call_id)
+        
+        # Extract metadata
+        agent_id = call_data.get('agentId', 'Unknown')
+        duration = call_data.get('duration', 0)
+        call_date = call_data.get('date', datetime.now().isoformat())
         
         try:
             # Download audio
@@ -510,8 +433,8 @@ class LiveCallMonitor:
             try:
                 os.unlink(audio_file)
                 logger.info(f"🗑️  AUDIO DELETED: {call_id}")
-            except:
-                logger.error(f"❌ FAILED TO DELETE AUDIO: {call_id}")
+            except Exception as e:
+                logger.error(f"❌ FAILED TO DELETE AUDIO: {call_id} - {e}")
                 
             if not transcript:
                 logger.warning(f"❌ TRANSCRIPTION FAILED: {call_id}")
@@ -528,16 +451,16 @@ class LiveCallMonitor:
             cursor.execute('''
                 INSERT OR REPLACE INTO calls 
                 (call_id, timestamp, duration, transcript, category, summary, sentiment, priority, call_outcome, overall_score,
-                 call_success_rate, first_call_resolution, issue_identification, solution_effectiveness,
+                 agent_id, call_success_rate, first_call_resolution, issue_identification, solution_effectiveness,
                  customer_satisfaction, user_interaction_sentiment, customer_effort_score, wait_time_satisfaction,
                  communication_clarity, listening_skills, empathy_emotional_intelligence, product_service_knowledge,
                  call_control_flow, professionalism_courtesy, call_handling_efficiency, information_gathering,
                  follow_up_commitment, compliance_adherence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 call_id,
-                call_data.get('date', datetime.now().isoformat()),
-                call_data.get('duration', 0),
+                call_date,
+                duration,
                 transcript,
                 analysis.get('category', 'other'),
                 analysis.get('summary', ''),
@@ -545,6 +468,7 @@ class LiveCallMonitor:
                 analysis.get('priority', 2),
                 analysis.get('call_outcome', 'unknown'),
                 analysis.get('overall_score', 5.0),
+                agent_id,
                 
                 # Call Success & Resolution
                 analysis.get('call_success_rate', 5.0),
@@ -579,8 +503,8 @@ class LiveCallMonitor:
             # Emit real-time update with all KPIs
             call_result = {
                 'call_id': call_id,
-                'timestamp': call_data.get('date', datetime.now().isoformat()),
-                'duration': call_data.get('duration', 0),
+                'timestamp': call_date,
+                'duration': duration,
                 'transcript': transcript,
                 'category': analysis.get('category', 'other'),
                 'summary': analysis.get('summary', ''),
@@ -588,6 +512,7 @@ class LiveCallMonitor:
                 'priority': analysis.get('priority', 2),
                 'call_outcome': analysis.get('call_outcome', 'unknown'),
                 'overall_score': analysis.get('overall_score', 5.0),
+                'agent_id': agent_id,
                 'kpis': {
                     # Call Success & Resolution
                     'call_success_rate': analysis.get('call_success_rate', 5.0),
@@ -618,10 +543,12 @@ class LiveCallMonitor:
             }
             
             socketio.emit('new_call', call_result)
-            logger.info(f"Successfully processed and broadcasted call {call_id}")
+            logger.info(f"✅ CALL PROCESSED & BROADCASTED: {call_id}")
             
         except Exception as e:
-            logger.error(f"Error processing call {call_id}: {e}")
+            logger.error(f"❌ ERROR PROCESSING CALL {call_id}: {e}")
+            import traceback
+            logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
 
     def start_monitoring(self):
         """Start monitoring for new calls"""
