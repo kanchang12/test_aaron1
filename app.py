@@ -18,6 +18,10 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress HTTP request logs
+logging.getLogger('geventwebsocket.handler').setLevel(logging.WARNING)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -144,14 +148,35 @@ class LiveCallMonitor:
             'from': from_date.strftime('%Y-%m-%d %H:%M:%S')
         }
         
+        logger.info(f"🔎 SEARCHING CALLS FROM {from_date.strftime('%H:%M:%S')} TO {until_date.strftime('%H:%M:%S')}")
+        
         communications_url = f"{self.xelion_base_url}/communications"
+        logger.info(f"🌐 API URL: {communications_url}")
+        logger.info(f"📋 API PARAMS: {params}")
         
         try:
             response = self.session.get(communications_url, params=params, timeout=30)
+            logger.info(f"📡 API RESPONSE STATUS: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"❌ API ERROR: {response.status_code} - {response.text[:500]}")
+                return []
+            
             response.raise_for_status()
             
             data = response.json()
+            logger.info(f"📊 RAW API RESPONSE: {json.dumps(data, indent=2)[:1000]}...")
+            
             communications = data.get('data', [])
+            
+            logger.info(f"📞 XELION API RETURNED {len(communications)} TOTAL COMMUNICATIONS")
+            
+            # Show details of first few communications
+            for i, comm in enumerate(communications[:3]):
+                comm_obj = comm.get('object', {})
+                call_id = comm_obj.get('oid', 'NO_ID')
+                call_date = comm_obj.get('date', 'NO_DATE')
+                logger.info(f"📋 COMM #{i+1}: ID={call_id}, DATE={call_date}")
             
             # Filter for new calls
             new_calls = []
@@ -161,11 +186,21 @@ class LiveCallMonitor:
                 
                 if call_id and call_id not in self.processed_calls:
                     new_calls.append(comm_obj)
+                    logger.info(f"🆕 NEW CALL FOUND: {call_id}")
+                elif call_id:
+                    logger.info(f"⏭️  SKIPPING ALREADY PROCESSED: {call_id}")
+                else:
+                    logger.warning(f"⚠️  COMMUNICATION WITH NO ID: {comm_obj}")
                     
+            logger.info(f"✅ RETURNING {len(new_calls)} NEW CALLS FOR PROCESSING")
+            logger.info(f"🔄 TOTAL PROCESSED CALLS SO FAR: {len(self.processed_calls)}")
+            
             return new_calls
             
         except Exception as e:
-            logger.error(f"Failed to fetch recent calls: {e}")
+            logger.error(f"❌ FAILED TO FETCH CALLS FROM XELION: {e}")
+            import traceback
+            logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
             return []
 
     def download_audio(self, call_id: str) -> Optional[str]:
@@ -465,11 +500,35 @@ class LiveCallMonitor:
     def start_monitoring(self):
         """Start monitoring for new calls"""
         self.is_monitoring = True
-        logger.info("Started call monitoring")
+        logger.info("🎯 STARTING LIVE CALL MONITORING...")
         
         while self.is_monitoring:
             try:
-                recent_calls = self.get_recent_calls(minutes_back=5)
+                # Clean up old processed calls every hour
+                now = datetime.now()
+                if (now - self.last_cleanup).total_seconds() > 3600:  # 1 hour
+                    logger.info("🧹 CLEANING UP OLD PROCESSED CALLS...")
+                    self.processed_calls.clear()
+                    self.last_cleanup = now
+                    logger.info(f"✅ CLEARED PROCESSED CALLS LIST")
+                
+                # Check if we're still logged in
+                if not self.session_token:
+                    logger.warning("🔑 NO SESSION TOKEN - ATTEMPTING LOGIN...")
+                    if not self.login():
+                        logger.error("❌ LOGIN FAILED - RETRYING IN 60s")
+                        time.sleep(60)
+                        continue
+                
+                logger.info("🔍 CHECKING FOR NEW CALLS...")
+                recent_calls = self.get_recent_calls(minutes_back=15)  # Increased to 15 minutes
+                
+                logger.info(f"📊 FOUND {len(recent_calls)} NEW CALLS")
+                
+                if len(recent_calls) == 0:
+                    logger.info("💤 NO NEW CALLS FOUND - SLEEPING 30s")
+                else:
+                    logger.info(f"🚀 PROCESSING {len(recent_calls)} CALLS")
                 
                 for call_data in recent_calls:
                     # Process each call in a separate thread
@@ -480,7 +539,14 @@ class LiveCallMonitor:
                 time.sleep(30)  # Check every 30 seconds
                 
             except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}")
+                logger.error(f"❌ ERROR IN MONITORING: {e}")
+                import traceback
+                logger.error(f"💥 FULL ERROR: {traceback.format_exc()}")
+                
+                # Try to re-login on error
+                logger.info("🔄 ATTEMPTING RE-LOGIN AFTER ERROR...")
+                self.login()
+                
                 time.sleep(60)  # Wait longer on error
 
 # Initialize monitor
@@ -628,14 +694,19 @@ def handle_disconnect():
 
 def start_background_monitoring():
     """Start monitoring in background thread"""
+    logger.info("🚀 STARTING BACKGROUND MONITORING THREAD...")
     monitor_thread = threading.Thread(target=monitor.start_monitoring)
     monitor_thread.daemon = True
     monitor_thread.start()
+    logger.info("✅ BACKGROUND MONITORING THREAD STARTED")
 
 if __name__ == '__main__':
+    logger.info("🎯 INITIALIZING LIVE CALL MONITOR...")
+    
     # Start background monitoring
     start_background_monitoring()
     
+    logger.info("🌐 STARTING FLASK WEB SERVER...")
     # Run Flask app
     port = int(os.environ.get('PORT', 5000))
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
