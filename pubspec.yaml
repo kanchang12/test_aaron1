@@ -1,0 +1,67 @@
+author: Kanchan Ghosh (https://ikanchan.com)
+name: diisco_flutter
+description: Diisco - Hospitality gig platform for workers and venues
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # HTTP & API
+  http: ^1.1.0
+  dio: ^5.4.0
+  
+  # State Management
+  provider: ^6.1.1
+  get: ^4.6.6
+  
+  # Storage & Cache
+  shared_preferences: ^2.2.2
+  flutter_secure_storage: ^9.0.0
+  
+  # UI Components
+  google_fonts: ^6.1.0
+  flutter_svg: ^2.0.9
+  cached_network_image: ^3.3.0
+  image_picker: ^1.0.5
+  file_picker: ^8.0.1  # Updated to fix Registrar error
+  table_calendar: ^3.0.9  # For availability calendar
+  qr_flutter: ^4.1.0  # For QR code generation
+  mobile_scanner: ^5.2.3  # For QR code scanning (modern alternative)
+  flutter_stripe: ^10.1.1  # For payment processing
+  
+  # Location & Maps
+  geolocator: ^10.1.0
+  google_maps_flutter: ^2.5.0
+  geocoding: ^2.1.1
+  
+  # Notifications
+  firebase_core: ^2.24.0
+  firebase_messaging: ^14.7.10
+  flutter_local_notifications: ^17.2.1 # Updated to fix bigLargeIcon error
+  
+  # Date & Time
+  intl: ^0.19.0
+  timeago: ^3.6.0
+  
+  # Utils
+  url_launcher: ^6.2.2
+  uuid: ^4.2.2
+  
+  cupertino_icons: ^1.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  # Note: Assets are commented out to prevent "directory not found" errors
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/
