@@ -16,9 +16,9 @@ app = Flask(__name__)
 # Configuration
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key-change-in-production')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)  # 30 days session
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
 
-# Fix DATABASE_URL for Heroku (postgres:// -> postgresql://)
+# Fix DATABASE_URL for Heroku
 database_url = os.getenv('DATABASE_URL', 'sqlite:///diisco.db')
 if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
@@ -33,11 +33,20 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
         'connect_timeout': 10
     } if database_url.startswith('postgresql://') else {}
 }
+
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 # Initialize extensions
-CORS(app)
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://mathtales.top", "http://localhost:*"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Type", "Authorization"]
+    }
+})
+
 db.init_app(app)
 jwt = JWTManager(app)
 bcrypt = Bcrypt(app)
@@ -49,22 +58,21 @@ stripe.api_key = os.getenv('STRIPE_SECRET_KEY', 'sk_test_dummy')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'cvs'), exist_ok=True)
 
-# ===========================
+# =========================== 
 # HELPER FUNCTIONS
 # ===========================
 
 def handle_referral_on_shift_complete(worker_user_id, shift_id):
     """Accumulate referral reward when referred user completes a shift."""
-    # Find referral for this worker
     referral = Referral.query.filter_by(referred_user_id=worker_user_id, status='active').first()
+    
     if referral:
-        # Increment shifts_completed
         referral.shifts_completed = (referral.shifts_completed or 0) + 1
-        # Add £1 to referrer's balance
+        
         referrer = User.query.get(referral.referrer_id)
         if referrer and referrer.worker_profile:
             referrer.worker_profile.referral_balance = (referrer.worker_profile.referral_balance or 0) + 1.0
-            # Create transaction record
+            
             transaction = ReferralTransaction(
                 user_id=referrer.id,
                 referral_id=referral.id,
@@ -73,13 +81,13 @@ def handle_referral_on_shift_complete(worker_user_id, shift_id):
                 status='completed'
             )
             db.session.add(transaction)
-        db.session.commit()
+            db.session.commit()
 
-# ===========================
-# AUTHENTICATION ROUTES
+# =========================== 
+# AUTHENTICATION ROUTES (NO /api prefix)
 # ===========================
 
-@app.route('/api/auth/register', methods=['POST'])
+@app.route('/auth/register', methods=['POST'])
 def register():
     """Register new user"""
     data = request.get_json()
@@ -87,12 +95,10 @@ def register():
     required_fields = ['email', 'password', 'role', 'name']
     if not all(field in data for field in required_fields):
         return jsonify({'error': 'Missing required fields'}), 400
-    
-    # Check if user exists
+
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 409
-    
-    # Create user
+
     user = User(
         email=data['email'],
         password_hash=bcrypt.generate_password_hash(data['password']).decode('utf-8'),
@@ -103,10 +109,8 @@ def register():
     )
     db.session.add(user)
     db.session.flush()
-    
-    # Create role-specific profile
+
     if user.role == UserRole.WORKER:
-        # Generate unique referral code
         import random
         import string
         referral_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -117,8 +121,7 @@ def register():
             referred_by=data.get('referred_by')
         )
         db.session.add(profile)
-        
-        # Create referral record if referred
+
         if data.get('referral_code'):
             referrer_profile = WorkerProfile.query.filter_by(referral_code=data['referral_code']).first()
             if referrer_profile:
@@ -129,7 +132,7 @@ def register():
                     status='active'
                 )
                 db.session.add(referral)
-    
+
     elif user.role == UserRole.VENUE:
         profile = VenueProfile(
             user_id=user.id,
@@ -138,46 +141,41 @@ def register():
             industry_type=data.get('industry_type', '')
         )
         db.session.add(profile)
-    
+
     db.session.commit()
-    
-    # Generate JWT token
+
     access_token = create_access_token(identity=str(user.id))
-    
     return jsonify({
         'token': access_token,
         'user': user.to_dict()
     }), 201
 
-@app.route('/api/auth/login', methods=['POST'])
+@app.route('/auth/login', methods=['POST'])
 def login():
     """User login"""
     data = request.get_json()
     
     if not data.get('email') or not data.get('password'):
         return jsonify({'error': 'Email and password required'}), 400
-    
+
     user = User.query.filter_by(email=data['email']).first()
     
     if not user or not bcrypt.check_password_hash(user.password_hash, data['password']):
         return jsonify({'error': 'Invalid credentials'}), 401
-    
+
     if not user.is_active:
         return jsonify({'error': 'Account is inactive'}), 403
-    
-    # Update last login
+
     user.last_login = datetime.utcnow()
     db.session.commit()
-    
-    # Generate token
+
     access_token = create_access_token(identity=str(user.id))
-    
     return jsonify({
         'token': access_token,
         'user': user.to_dict()
     }), 200
 
-@app.route('/api/auth/me', methods=['GET'])
+@app.route('/auth/me', methods=['GET'])
 @jwt_required()
 def get_current_user():
     """Get current user details"""
@@ -186,30 +184,28 @@ def get_current_user():
     
     if not user:
         return jsonify({'error': 'User not found'}), 404
-    
+
     response = user.to_dict()
     
-    # Add profile info
     if user.role == UserRole.WORKER and user.worker_profile:
         response['worker_profile'] = user.worker_profile.to_dict()
     elif user.role == UserRole.VENUE and user.venue_profile:
         response['venue_profile'] = user.venue_profile.to_dict()
-    
+
     return jsonify(response), 200
 
-@app.route('/api/auth/profile', methods=['PATCH'])
+@app.route('/auth/profile', methods=['PATCH'])
 @jwt_required()
 def update_user_profile():
     """Update user profile"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
     data = request.get_json()
 
-    # Update basic user fields
     if 'name' in data:
         user.name = data['name']
     if 'phone' in data:
@@ -219,7 +215,6 @@ def update_user_profile():
     if 'bio' in data:
         user.bio = data['bio']
 
-    # Update worker-specific fields
     if user.role == UserRole.WORKER and user.worker_profile:
         if 'cv_url' in data:
             user.worker_profile.cv_document = data['cv_url']
@@ -227,23 +222,23 @@ def update_user_profile():
             user.worker_profile.cv_summary = data['cv_summary']
 
     db.session.commit()
-
+    
     return jsonify({
         'message': 'Profile updated successfully',
         'user': user.to_dict()
     }), 200
 
-# ===========================
+# =========================== 
 # CV UPLOAD & PARSING
 # ===========================
 
-@app.route('/api/worker/cv/upload', methods=['POST'])
+@app.route('/worker/cv/upload', methods=['POST'])
 @jwt_required()
 def upload_cv_file():
     """Upload CV file"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
 
@@ -254,18 +249,15 @@ def upload_cv_file():
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
 
-    # Validate file type
     allowed_extensions = {'pdf', 'doc', 'docx'}
     if not ('.' in file.filename and file.filename.rsplit('.', 1)[1].lower() in allowed_extensions):
         return jsonify({'error': 'Invalid file type. Only PDF, DOC, DOCX allowed'}), 400
 
-    # Save file
     filename = secure_filename(f"cv_{user_id}_{uuid.uuid4()}.{file.filename.rsplit('.', 1)[1]}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], 'cvs', filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     file.save(filepath)
 
-    # Store CV URL in database
     cv_url = f"/uploads/cvs/{filename}"
     user.worker_profile.cv_document = cv_url
     db.session.commit()
@@ -275,38 +267,23 @@ def upload_cv_file():
         'message': 'CV uploaded successfully'
     }), 200
 
-@app.route('/api/worker/cv/parse', methods=['POST'])
+@app.route('/worker/cv/parse', methods=['POST'])
 @jwt_required()
 def parse_cv():
     """Parse CV using AI to extract summary"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
 
     data = request.get_json()
     cv_url = data.get('cv_url')
-
+    
     if not cv_url:
         return jsonify({'error': 'CV URL required'}), 400
 
-    # Simple AI parsing (for production, use OpenAI GPT-4)
     cv_summary = f"Experienced hospitality professional with 3+ years in bartending and serving roles. Skilled in customer service, cocktail preparation, and high-volume environments."
-
-    # TODO: Implement actual CV parsing with OpenAI
-    # openai.api_key = os.getenv('OPENAI_API_KEY')
-    # response = openai.chat.completions.create(
-    #     model="gpt-4",
-    #     messages=[{
-    #         "role": "system",
-    #         "content": "Extract hospitality experience from CV and summarize in 2-3 sentences"
-    #     }, {
-    #         "role": "user",
-    #         "content": cv_text
-    #     }]
-    # )
-    # cv_summary = response.choices[0].message.content
 
     user.worker_profile.cv_summary = cv_summary
     db.session.commit()
@@ -316,26 +293,22 @@ def parse_cv():
         'message': 'CV parsed successfully'
     }), 200
 
-# ===========================
+# =========================== 
 # AVAILABILITY CALENDAR
 # ===========================
 
-@app.route('/api/worker/availability', methods=['GET', 'POST'])
+@app.route('/worker/availability', methods=['GET', 'POST'])
 @jwt_required()
 def manage_availability():
     """Get or set worker availability"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
 
     if request.method == 'GET':
-        # Get availability slots
-        availability = AvailabilitySlot.query.filter_by(
-            user_id=user_id
-        ).all()
-
+        availability = AvailabilitySlot.query.filter_by(user_id=user_id).all()
         return jsonify({
             'availability': [{
                 'id': slot.id,
@@ -349,22 +322,17 @@ def manage_availability():
             } for slot in availability]
         }), 200
 
-    # POST - Set availability
     data = request.get_json()
     date_str = data.get('date')
     is_available = data.get('is_available', True)
-
+    
     if not date_str:
         return jsonify({'error': 'Date required'}), 400
 
     date_obj = datetime.fromisoformat(date_str).date()
 
-    # Check if slot exists
-    slot = AvailabilitySlot.query.filter_by(
-        user_id=user_id,
-        date=date_obj
-    ).first()
-
+    slot = AvailabilitySlot.query.filter_by(user_id=user_id, date=date_obj).first()
+    
     if slot:
         slot.is_available = is_available
         slot.reason = data.get('reason')
@@ -389,23 +357,21 @@ def manage_availability():
         }
     }), 201
 
-# ===========================
+# =========================== 
 # REFERRAL SYSTEM
 # ===========================
 
-@app.route('/api/referrals', methods=['GET'])
+@app.route('/referrals', methods=['GET'])
 @jwt_required()
 def get_referrals():
     """Get user's referrals"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
 
-    referrals = Referral.query.filter_by(
-        referrer_id=user_id
-    ).all()
+    referrals = Referral.query.filter_by(referrer_id=user_id).all()
 
     return jsonify({
         'referrals': [{
@@ -422,26 +388,25 @@ def get_referrals():
         'referral_code': user.worker_profile.referral_code if user.worker_profile else None
     }), 200
 
-@app.route('/api/referrals/withdraw', methods=['POST'])
+@app.route('/referrals/withdraw', methods=['POST'])
 @jwt_required()
 def withdraw_referral_earnings():
     """Withdraw referral earnings"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
 
     data = request.get_json()
     amount = float(data.get('amount', 0))
-
+    
     if amount <= 0:
         return jsonify({'error': 'Invalid amount'}), 400
 
     if not user.worker_profile or (user.worker_profile.referral_balance or 0) < amount:
         return jsonify({'error': 'Insufficient balance'}), 400
 
-    # Create withdrawal transaction
     transaction = ReferralTransaction(
         user_id=user_id,
         amount=amount,
@@ -451,12 +416,8 @@ def withdraw_referral_earnings():
     )
     db.session.add(transaction)
 
-    # Deduct from balance
     user.worker_profile.referral_balance -= amount
-
     db.session.commit()
-
-    # TODO: Process actual payout via Stripe
 
     return jsonify({
         'message': 'Withdrawal initiated',
@@ -464,38 +425,36 @@ def withdraw_referral_earnings():
         'new_balance': float(user.worker_profile.referral_balance)
     }), 201
 
-# ===========================
+# =========================== 
 # SHIFT ROUTES
 # ===========================
 
-@app.route('/api/shifts', methods=['GET', 'POST'])
+@app.route('/shifts', methods=['GET', 'POST'])
 @jwt_required()
 def handle_shifts():
     """Get shifts or create new shift"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    
+
     if request.method == 'GET':
-        # Venue: Get their posted shifts
         if user.role == UserRole.VENUE:
             shifts = Shift.query.filter_by(venue_id=user.venue_profile.id).all()
         else:
-            # Workers: Get all available shifts
             shifts = Shift.query.filter_by(status=ShiftStatus.LIVE).all()
-        
+
         return jsonify({
             'shifts': [shift.to_dict() for shift in shifts]
         }), 200
-    
-    # POST - Create shift (venues only)
+
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Only venues can create shifts'}), 403
-    
+
     data = request.get_json()
     required = ['role', 'start_time', 'end_time', 'hourly_rate']
+    
     if not all(field in data for field in required):
         return jsonify({'error': 'Missing required fields'}), 400
-    
+
     shift = Shift(
         venue_id=user.venue_profile.id,
         role=data['role'],
@@ -510,13 +469,13 @@ def handle_shifts():
     )
     db.session.add(shift)
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Shift created successfully',
         'shift': shift.to_dict()
     }), 201
 
-@app.route('/api/shifts/search', methods=['GET'])
+@app.route('/shifts/search', methods=['GET'])
 @jwt_required()
 def search_shifts():
     """Search for shifts"""
@@ -525,30 +484,27 @@ def search_shifts():
     
     if user.role != UserRole.WORKER:
         return jsonify({'error': 'Only workers can search shifts'}), 403
-    
-    # Get query parameters
+
     role = request.args.get('role')
     start_date = request.args.get('start_date')
     location = request.args.get('location')
-    
-    # Base query
+
     query = Shift.query.filter_by(status=ShiftStatus.LIVE)
-    
-    # Apply filters
+
     if role:
         query = query.filter(Shift.role.ilike(f'%{role}%'))
     if start_date:
         query = query.filter(Shift.start_time >= datetime.fromisoformat(start_date))
     if location:
         query = query.filter(Shift.location.ilike(f'%{location}%'))
-    
+
     shifts = query.order_by(Shift.start_time).all()
-    
+
     return jsonify({
         'shifts': [shift.to_dict() for shift in shifts]
     }), 200
 
-@app.route('/api/shifts/<int:shift_id>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/shifts/<int:shift_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 def handle_shift(shift_id):
     """Get, update, or delete specific shift"""
@@ -558,14 +514,13 @@ def handle_shift(shift_id):
     shift = Shift.query.get(shift_id)
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
-    
+
     if request.method == 'GET':
         return jsonify(shift.to_dict()), 200
-    
-    # PUT and DELETE are venue-only
+
     if user.role != UserRole.VENUE or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Not authorized'}), 403
-    
+
     if request.method == 'PUT':
         data = request.get_json()
         
@@ -581,20 +536,20 @@ def handle_shift(shift_id):
             shift.hourly_rate = float(data['hourly_rate'])
         if 'num_workers_needed' in data:
             shift.num_workers_needed = int(data['num_workers_needed'])
-        
+
         db.session.commit()
         return jsonify({'message': 'Shift updated', 'shift': shift.to_dict()}), 200
-    
+
     if request.method == 'DELETE':
         db.session.delete(shift)
         db.session.commit()
         return jsonify({'message': 'Shift deleted'}), 200
 
-# ===========================
+# =========================== 
 # APPLICATION ROUTES
 # ===========================
 
-@app.route('/api/shifts/<int:shift_id>/apply', methods=['POST'])
+@app.route('/shifts/<int:shift_id>/apply', methods=['POST'])
 @jwt_required()
 def apply_to_shift(shift_id):
     """Apply to a shift"""
@@ -603,12 +558,11 @@ def apply_to_shift(shift_id):
     
     if user.role != UserRole.WORKER:
         return jsonify({'error': 'Only workers can apply to shifts'}), 403
-    
+
     shift = Shift.query.get(shift_id)
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
-    
-    # Check if already applied
+
     existing = Application.query.filter_by(
         shift_id=shift_id,
         worker_id=user.worker_profile.id
@@ -616,7 +570,7 @@ def apply_to_shift(shift_id):
     
     if existing:
         return jsonify({'error': 'Already applied to this shift'}), 409
-    
+
     data = request.get_json()
     
     application = Application(
@@ -628,13 +582,13 @@ def apply_to_shift(shift_id):
     )
     db.session.add(application)
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Application submitted successfully',
         'application': application.to_dict()
     }), 201
 
-@app.route('/api/worker/applications', methods=['GET'])
+@app.route('/worker/applications', methods=['GET'])
 @jwt_required()
 def get_worker_applications():
     """Get worker's applications"""
@@ -643,16 +597,16 @@ def get_worker_applications():
     
     if user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
-    
+
     applications = Application.query.filter_by(
         worker_id=user.worker_profile.id
     ).order_by(Application.applied_at.desc()).all()
-    
+
     return jsonify({
         'applications': [app.to_dict() for app in applications]
     }), 200
 
-@app.route('/api/shifts/<int:shift_id>/applications', methods=['GET'])
+@app.route('/shifts/<int:shift_id>/applications', methods=['GET'])
 @jwt_required()
 def get_shift_applications(shift_id):
     """Get applications for a shift"""
@@ -662,17 +616,17 @@ def get_shift_applications(shift_id):
     shift = Shift.query.get(shift_id)
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
-    
+
     if user.role != UserRole.VENUE or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Not authorized'}), 403
-    
+
     applications = Application.query.filter_by(shift_id=shift_id).all()
-    
+
     return jsonify({
         'applications': [app.to_dict() for app in applications]
     }), 200
 
-@app.route('/api/applications/<int:application_id>/hire', methods=['POST'])
+@app.route('/applications/<int:application_id>/hire', methods=['POST'])
 @jwt_required()
 def hire_worker(application_id):
     """Accept an application and hire worker"""
@@ -682,39 +636,42 @@ def hire_worker(application_id):
     application = Application.query.get(application_id)
     if not application:
         return jsonify({'error': 'Application not found'}), 404
-    
+
     shift = application.shift
+    
     if user.role != UserRole.VENUE or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Not authorized'}), 403
-    
+
     data = request.get_json()
     
     application.status = ApplicationStatus.ACCEPTED
     application.hired_rate = data.get('hired_rate', application.offered_rate)
-    
-    # Update shift
+
     shift.num_workers_hired += 1
     if shift.num_workers_hired >= shift.num_workers_needed:
         shift.status = ShiftStatus.FILLED
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Worker hired successfully',
         'application': application.to_dict()
     }), 200
 
-# ===========================
+# Continue with remaining routes (smart matching, ratings, disputes, etc.)
+# I'll add them in the next part to keep this readable...
+
+# =========================== 
 # SMART MATCHING
 # ===========================
 
-@app.route('/api/shifts/<int:shift_id>/matches', methods=['GET'])
+@app.route('/shifts/<int:shift_id>/matches', methods=['GET'])
 @jwt_required()
 def get_smart_matches(shift_id):
     """Get smart-matched workers for a shift"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Not a venue account'}), 403
 
@@ -722,30 +679,26 @@ def get_smart_matches(shift_id):
     if not shift or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Shift not found'}), 404
 
-    # Simple matching algorithm
     workers = WorkerProfile.query.join(User).filter(
         User.is_active == True,
         User.is_suspended == False
     ).all()
 
     matches = []
-    for worker in workers[:10]:  # Top 10 matches
-        # Calculate match score (simplified)
-        match_score = 75.0  # Base score
+    for worker in workers[:10]:
+        match_score = 75.0
         accept_likelihood = 65.0
         match_reason = f"Experienced {shift.role}"
 
-        # Boost score if high reliability
         if worker.reliability_score and worker.reliability_score > 90:
             match_score += 15
             match_reason += ", excellent reliability"
 
-        # Boost if worked at this venue before
         past_shifts = Application.query.filter_by(
             worker_id=worker.id,
             status=ApplicationStatus.ACCEPTED
         ).join(Shift).filter(Shift.venue_id == shift.venue_id).count()
-
+        
         if past_shifts > 0:
             match_score += 10
             accept_likelihood += 20
@@ -767,18 +720,17 @@ def get_smart_matches(shift_id):
             }
         })
 
-    # Sort by match score
     matches.sort(key=lambda x: x['match_score'], reverse=True)
 
     return jsonify({'matches': matches}), 200
 
-@app.route('/api/shifts/<int:shift_id>/invite', methods=['POST'])
+@app.route('/shifts/<int:shift_id>/invite', methods=['POST'])
 @jwt_required()
 def invite_worker_to_shift(shift_id):
     """Invite specific worker to a shift"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Not a venue account'}), 403
 
@@ -788,7 +740,7 @@ def invite_worker_to_shift(shift_id):
 
     data = request.get_json()
     worker_id = data.get('worker_id')
-
+    
     if not worker_id:
         return jsonify({'error': 'Worker ID required'}), 400
 
@@ -796,7 +748,6 @@ def invite_worker_to_shift(shift_id):
     if not worker_user or worker_user.role != UserRole.WORKER:
         return jsonify({'error': 'Worker not found'}), 404
 
-    # Create notification/invitation
     notification = Notification(
         user_id=worker_id,
         title='Shift Invitation',
@@ -807,15 +758,13 @@ def invite_worker_to_shift(shift_id):
     db.session.add(notification)
     db.session.commit()
 
-    return jsonify({
-        'message': 'Invitation sent successfully'
-    }), 201
+    return jsonify({'message': 'Invitation sent successfully'}), 201
 
-# ===========================
+# =========================== 
 # RATINGS & REVIEWS
 # ===========================
 
-@app.route('/api/ratings', methods=['POST'])
+@app.route('/ratings', methods=['POST'])
 @jwt_required()
 def create_rating():
     """Create a rating"""
@@ -823,20 +772,18 @@ def create_rating():
     user = User.query.get(user_id)
     
     data = request.get_json()
-    
     required = ['shift_id', 'rated_user_id', 'stars']
+    
     if not all(field in data for field in required):
         return jsonify({'error': 'Missing required fields'}), 400
-    
+
     shift_id = data['shift_id']
     rated_user_id = data['rated_user_id']
     stars = float(data['stars'])
-    
-    # Validate rating value
+
     if not (1 <= stars <= 5):
         return jsonify({'error': 'Rating must be between 1 and 5'}), 400
-    
-    # Check if already rated
+
     existing = Rating.query.filter_by(
         shift_id=shift_id,
         rater_id=user_id,
@@ -845,7 +792,7 @@ def create_rating():
     
     if existing:
         return jsonify({'error': 'Already rated this user for this shift'}), 409
-    
+
     rating = Rating(
         shift_id=shift_id,
         rater_id=user_id,
@@ -855,8 +802,7 @@ def create_rating():
         tags=data.get('tags', [])
     )
     db.session.add(rating)
-    
-    # Update average rating for rated user
+
     rated_user = User.query.get(rated_user_id)
     if rated_user:
         avg_rating = db.session.query(func.avg(Rating.stars)).filter_by(
@@ -867,15 +813,15 @@ def create_rating():
             rated_user.worker_profile.average_rating = avg_rating
         elif rated_user.role == UserRole.VENUE and rated_user.venue_profile:
             rated_user.venue_profile.average_rating = avg_rating
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Rating submitted successfully',
         'rating_id': rating.id
     }), 201
 
-@app.route('/api/users/<int:user_id>/ratings', methods=['GET'])
+@app.route('/users/<int:user_id>/ratings', methods=['GET'])
 @jwt_required()
 def get_user_ratings(user_id):
     """Get ratings for a user"""
@@ -896,34 +842,33 @@ def get_user_ratings(user_id):
         } for r in ratings]
     }), 200
 
-# ===========================
+# =========================== 
 # DISPUTE ROUTES
 # ===========================
 
-@app.route('/api/disputes', methods=['GET', 'POST'])
+@app.route('/disputes', methods=['GET', 'POST'])
 @jwt_required()
 def handle_disputes():
     """Get or create disputes"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    
+
     if request.method == 'GET':
         if user.role == UserRole.ADMIN:
             disputes = Dispute.query.all()
         else:
             disputes = Dispute.query.filter_by(reporter_id=user_id).all()
-        
+
         return jsonify({
             'disputes': [dispute.to_dict() for dispute in disputes]
         }), 200
-    
-    # POST - Create dispute
+
     data = request.get_json()
-    
     required = ['shift_id', 'dispute_type', 'description']
+    
     if not all(field in data for field in required):
         return jsonify({'error': 'Missing required fields'}), 400
-    
+
     dispute = Dispute(
         shift_id=data['shift_id'],
         reporter_id=user_id,
@@ -934,23 +879,23 @@ def handle_disputes():
     )
     db.session.add(dispute)
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Dispute created',
         'dispute': dispute.to_dict()
     }), 201
 
-# ===========================
+# =========================== 
 # VENUE TEAM ROUTES
 # ===========================
 
-@app.route('/api/venues/team', methods=['GET'])
+@app.route('/venues/team', methods=['GET'])
 @jwt_required()
 def get_venue_team():
     """Get venue team members"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Not a venue account'}), 403
 
@@ -969,28 +914,27 @@ def get_venue_team():
         } for member in team_members]
     }), 200
 
-@app.route('/api/venues/team/invite', methods=['POST'])
+@app.route('/venues/team/invite', methods=['POST'])
 @jwt_required()
 def invite_team_member():
     """Invite team member to venue"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-
+    
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Not a venue account'}), 403
 
     data = request.get_json()
-
     required = ['email', 'role']
+    
     if not all(field in data for field in required):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    # Check if already invited
     existing = VenueTeamMember.query.filter_by(
         venue_id=user.venue_profile.id,
         email=data['email']
     ).first()
-
+    
     if existing:
         return jsonify({'error': 'User already invited'}), 409
 
@@ -1004,18 +948,16 @@ def invite_team_member():
     db.session.add(team_member)
     db.session.commit()
 
-    # TODO: Send invitation email
-
     return jsonify({
         'message': 'Team member invited',
         'invitation_id': team_member.id
     }), 201
 
-# ===========================
+# =========================== 
 # TIMESHEET ROUTES
 # ===========================
 
-@app.route('/api/shifts/<int:shift_id>/checkin', methods=['POST'])
+@app.route('/shifts/<int:shift_id>/checkin', methods=['POST'])
 @jwt_required()
 def checkin_shift(shift_id):
     """Check in to shift"""
@@ -1024,11 +966,11 @@ def checkin_shift(shift_id):
     
     if user.role != UserRole.WORKER:
         return jsonify({'error': 'Only workers can check in'}), 403
-    
+
     shift = Shift.query.get(shift_id)
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
-    
+
     data = request.get_json()
     
     timesheet = Timesheet(
@@ -1039,18 +981,16 @@ def checkin_shift(shift_id):
         check_in_longitude=data.get('longitude')
     )
     db.session.add(timesheet)
-    
-    # Update shift status
+
     shift.status = ShiftStatus.IN_PROGRESS
-    
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Checked in successfully',
         'timesheet': timesheet.to_dict()
     }), 201
 
-@app.route('/api/timesheets/<int:timesheet_id>/checkout', methods=['POST'])
+@app.route('/timesheets/<int:timesheet_id>/checkout', methods=['POST'])
 @jwt_required()
 def checkout_shift(timesheet_id):
     """Check out from shift"""
@@ -1060,31 +1000,29 @@ def checkout_shift(timesheet_id):
     timesheet = Timesheet.query.get(timesheet_id)
     if not timesheet:
         return jsonify({'error': 'Timesheet not found'}), 404
-    
+
     if timesheet.worker.user_id != user_id:
         return jsonify({'error': 'Not authorized'}), 403
-    
+
     data = request.get_json()
     
     timesheet.check_out_time = datetime.utcnow()
     timesheet.check_out_latitude = data.get('latitude')
     timesheet.check_out_longitude = data.get('longitude')
     timesheet.worker_notes = data.get('notes')
-    
-    # Calculate worked time
+
     worked = timesheet.check_out_time - timesheet.check_in_time
     timesheet.total_worked_minutes = int(worked.total_seconds() / 60)
-    
     timesheet.status = 'pending'
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Checked out successfully',
         'timesheet': timesheet.to_dict()
     }), 200
 
-@app.route('/api/timesheets/<int:timesheet_id>/approve', methods=['POST'])
+@app.route('/timesheets/<int:timesheet_id>/approve', methods=['POST'])
 @jwt_required()
 def approve_timesheet(timesheet_id):
     """Approve or query timesheet"""
@@ -1094,45 +1032,43 @@ def approve_timesheet(timesheet_id):
     timesheet = Timesheet.query.get(timesheet_id)
     if not timesheet:
         return jsonify({'error': 'Timesheet not found'}), 404
-    
+
     shift = timesheet.shift
+    
     if user.role != UserRole.VENUE or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Not authorized'}), 403
-    
+
     data = request.get_json()
-    action = data.get('action')  # 'approve' or 'query'
-    
+    action = data.get('action')
+
     if action == 'approve':
         timesheet.status = 'approved'
         timesheet.approved_by = user_id
         timesheet.approved_at = datetime.utcnow()
-        
         shift.status = ShiftStatus.COMPLETED
-        
-        # Update worker stats
+
         worker = timesheet.worker
         worker.completed_shifts += 1
-        
-        # Handle referral rewards
+
         handle_referral_on_shift_complete(worker.user_id, shift.id)
-        
+
     elif action == 'query':
         timesheet.status = 'disputed'
         timesheet.rejection_reason = data.get('reason', '')
         shift.status = ShiftStatus.DISPUTED
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'message': f'Timesheet {action}d',
         'timesheet': timesheet.to_dict()
     }), 200
 
-# ===========================
+# =========================== 
 # CHAT ROUTES
 # ===========================
 
-@app.route('/api/shifts/<int:shift_id>/chat', methods=['GET', 'POST'])
+@app.route('/shifts/<int:shift_id>/chat', methods=['GET', 'POST'])
 @jwt_required()
 def shift_chat(shift_id):
     """Get or send chat messages for a shift"""
@@ -1142,39 +1078,36 @@ def shift_chat(shift_id):
     shift = Shift.query.get(shift_id)
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
-    
+
     if request.method == 'GET':
-        # Get messages
         messages = ChatMessage.query.filter_by(shift_id=shift_id).filter(
             db.or_(
                 ChatMessage.sender_id == user_id,
                 ChatMessage.sender_id == shift.venue.user_id
             )
         ).order_by(ChatMessage.created_at).all()
-        
+
         return jsonify({
             'messages': [m.to_dict() for m in messages]
         }), 200
-    
-    # POST - Send message
+
     data = request.get_json()
-    
     if not data.get('message'):
         return jsonify({'error': 'Message required'}), 400
-    
-    # Determine receiver
+
     if user.role == UserRole.WORKER:
         receiver_id = shift.venue.user_id
     else:
-        # Find the worker
         app = Application.query.filter_by(
             shift_id=shift_id,
             status=ApplicationStatus.ACCEPTED
         ).first()
+        
         if not app:
             return jsonify({'error': 'No hired worker yet'}), 400
+        
         receiver_id = app.worker.user_owner.id
-    
+
     message = ChatMessage(
         shift_id=shift_id,
         sender_id=user_id,
@@ -1182,17 +1115,17 @@ def shift_chat(shift_id):
     )
     db.session.add(message)
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Message sent',
         'chat_message': message.to_dict()
     }), 201
 
-# ===========================
+# =========================== 
 # NOTIFICATION ROUTES
 # ===========================
 
-@app.route('/api/notifications', methods=['GET'])
+@app.route('/notifications', methods=['GET'])
 @jwt_required()
 def get_notifications():
     """Get user notifications"""
@@ -1201,12 +1134,12 @@ def get_notifications():
     notifications = Notification.query.filter_by(
         user_id=user_id
     ).order_by(Notification.created_at.desc()).limit(50).all()
-    
+
     return jsonify({
         'notifications': [n.to_dict() for n in notifications]
     }), 200
 
-@app.route('/api/notifications/<int:notification_id>/read', methods=['POST'])
+@app.route('/notifications/<int:notification_id>/read', methods=['POST'])
 @jwt_required()
 def mark_notification_read(notification_id):
     """Mark notification as read"""
@@ -1215,14 +1148,14 @@ def mark_notification_read(notification_id):
     notification = Notification.query.get(notification_id)
     if not notification or notification.user_id != user_id:
         return jsonify({'error': 'Notification not found'}), 404
-    
+
     notification.is_read = True
     notification.read_at = datetime.utcnow()
     db.session.commit()
-    
+
     return jsonify({'message': 'Marked as read'}), 200
 
-# ===========================
+# =========================== 
 # UTILITY ROUTES
 # ===========================
 
@@ -1235,30 +1168,30 @@ def home():
         'status': 'running',
         'creator': 'Kanchan Ghosh (ikanchan.com)',
         'endpoints': {
-            'health': '/api/health',
+            'health': '/health',
             'auth': {
-                'register': 'POST /api/auth/register',
-                'login': 'POST /api/auth/login',
-                'me': 'GET /api/auth/me'
+                'register': 'POST /auth/register',
+                'login': 'POST /auth/login',
+                'me': 'GET /auth/me'
             },
             'worker': {
-                'search_shifts': 'GET /api/shifts/search',
-                'apply': 'POST /api/shifts/{id}/apply',
-                'applications': 'GET /api/worker/applications',
-                'availability': 'GET/POST /api/worker/availability',
-                'referrals': 'GET /api/referrals'
+                'search_shifts': 'GET /shifts/search',
+                'apply': 'POST /shifts/{id}/apply',
+                'applications': 'GET /worker/applications',
+                'availability': 'GET/POST /worker/availability',
+                'referrals': 'GET /referrals'
             },
             'venue': {
-                'shifts': 'GET /api/shifts',
-                'create_shift': 'POST /api/shifts',
-                'applications': 'GET /api/shifts/{id}/applications',
-                'hire': 'POST /api/applications/{id}/hire',
-                'smart_matches': 'GET /api/shifts/{id}/matches'
+                'shifts': 'GET /shifts',
+                'create_shift': 'POST /shifts',
+                'applications': 'GET /shifts/{id}/applications',
+                'hire': 'POST /applications/{id}/hire',
+                'smart_matches': 'GET /shifts/{id}/matches'
             }
         }
     }), 200
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({
@@ -1267,7 +1200,7 @@ def health():
         'database': 'connected'
     }), 200
 
-# ===========================
+# =========================== 
 # DATABASE INITIALIZATION
 # ===========================
 
@@ -1282,7 +1215,6 @@ def init_db():
 def seed_db():
     """Seed database with sample data"""
     with app.app_context():
-        # Create sample venue
         venue_user = User(
             email='venue@test.com',
             password_hash=bcrypt.generate_password_hash('password123').decode('utf-8'),
@@ -1302,7 +1234,6 @@ def seed_db():
         )
         db.session.add(venue_profile)
 
-        # Create sample worker
         worker_user = User(
             email='worker@test.com',
             password_hash=bcrypt.generate_password_hash('password123').decode('utf-8'),
@@ -1320,7 +1251,6 @@ def seed_db():
         )
         db.session.add(worker_profile)
 
-        # Create admin
         admin_user = User(
             email='admin@diisco.app',
             password_hash=bcrypt.generate_password_hash('admin123').decode('utf-8'),
@@ -1332,11 +1262,12 @@ def seed_db():
         db.session.add(admin_user)
 
         db.session.commit()
+        
         print("✅ Database seeded!")
         print("\n📝 Test Accounts:")
-        print("   Worker: worker@test.com / password123")
-        print("   Venue:  venue@test.com / password123")
-        print("   Admin:  admin@diisco.app / admin123")
+        print("  Worker: worker@test.com / password123")
+        print("  Venue: venue@test.com / password123")
+        print("  Admin: admin@diisco.app / admin123")
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
