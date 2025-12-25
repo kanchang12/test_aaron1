@@ -14,6 +14,7 @@ app = Flask(__name__)
 # Configuration
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key-change-in-production')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)  # 30 days session
 
 # Fix DATABASE_URL for Heroku (postgres:// -> postgresql://)
 database_url = os.getenv('DATABASE_URL', 'sqlite:///diisco.db')
@@ -1056,6 +1057,9 @@ def apply_to_shift(shift_id):
 
     if not user or user.role != UserRole.WORKER:
         return jsonify({'error': 'Not a worker account'}), 403
+
+    if not user.worker_profile:
+        return jsonify({'error': 'Worker profile not found. Please complete your profile first.'}), 400
 
     shift = Shift.query.get(shift_id)
     if not shift:
