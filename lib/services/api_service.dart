@@ -164,7 +164,7 @@ class ApiService {
     if (minRate != null) queryParams['min_rate'] = minRate.toString();
     if (startDate != null) queryParams['start_date'] = startDate;
 
-    final uri = Uri.parse('$baseUrl/shifts/search').replace(queryParameters: queryParams);
+    final uri = Uri.parse('$baseUrl/api/shifts/search').replace(queryParameters: queryParams);
     final response = await http.get(uri, headers: await getHeaders());
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
@@ -181,7 +181,7 @@ class ApiService {
 
   Future<List<Map<String, dynamic>>> getShiftRecommendations() async {
     final response = await http.get(
-      Uri.parse('$baseUrl/worker/recommendations'),
+      Uri.parse('$baseUrl/api/worker/recommendations'),
       headers: await getHeaders(),
     );
 
