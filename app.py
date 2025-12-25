@@ -51,18 +51,27 @@ db.init_app(app)
 jwt = JWTManager(app)
 bcrypt = Bcrypt(app)
 
-# Stripe configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY', 'sk_test_dummy')
 
-# Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'cvs'), exist_ok=True)
 
 # =========================== 
-# HELPER FUNCTIONS
+# MIDDLEWARE: Strip /api prefix
 # ===========================
 
-app.config['APPLICATION_ROOT'] = '/api'
+@app.before_request
+def strip_api_prefix():
+    """Handle both /api/path and /path routes"""
+    if request.path.startswith('/api/'):
+        # Store the original path
+        request.environ['ORIGINAL_PATH'] = request.path
+        # Rewrite the path without /api
+        request.environ['PATH_INFO'] = request.path[4:]
+
+# =========================== 
+# HELPER FUNCTIONS
+# ===========================
 
 def handle_referral_on_shift_complete(worker_user_id, shift_id):
     """Accumulate referral reward when referred user completes a shift."""
@@ -86,7 +95,7 @@ def handle_referral_on_shift_complete(worker_user_id, shift_id):
             db.session.commit()
 
 # =========================== 
-# AUTHENTICATION ROUTES (NO /api prefix)
+# AUTHENTICATION ROUTES
 # ===========================
 
 @app.route('/auth/register', methods=['POST'])
@@ -547,10 +556,6 @@ def handle_shift(shift_id):
         db.session.commit()
         return jsonify({'message': 'Shift deleted'}), 200
 
-# =========================== 
-# APPLICATION ROUTES
-# ===========================
-
 @app.route('/shifts/<int:shift_id>/apply', methods=['POST'])
 @jwt_required()
 def apply_to_shift(shift_id):
@@ -660,13 +665,6 @@ def hire_worker(application_id):
         'application': application.to_dict()
     }), 200
 
-# Continue with remaining routes (smart matching, ratings, disputes, etc.)
-# I'll add them in the next part to keep this readable...
-
-# =========================== 
-# SMART MATCHING
-# ===========================
-
 @app.route('/shifts/<int:shift_id>/matches', methods=['GET'])
 @jwt_required()
 def get_smart_matches(shift_id):
@@ -762,10 +760,6 @@ def invite_worker_to_shift(shift_id):
 
     return jsonify({'message': 'Invitation sent successfully'}), 201
 
-# =========================== 
-# RATINGS & REVIEWS
-# ===========================
-
 @app.route('/ratings', methods=['POST'])
 @jwt_required()
 def create_rating():
@@ -844,10 +838,6 @@ def get_user_ratings(user_id):
         } for r in ratings]
     }), 200
 
-# =========================== 
-# DISPUTE ROUTES
-# ===========================
-
 @app.route('/disputes', methods=['GET', 'POST'])
 @jwt_required()
 def handle_disputes():
@@ -886,10 +876,6 @@ def handle_disputes():
         'message': 'Dispute created',
         'dispute': dispute.to_dict()
     }), 201
-
-# =========================== 
-# VENUE TEAM ROUTES
-# ===========================
 
 @app.route('/venues/team', methods=['GET'])
 @jwt_required()
@@ -954,10 +940,6 @@ def invite_team_member():
         'message': 'Team member invited',
         'invitation_id': team_member.id
     }), 201
-
-# =========================== 
-# TIMESHEET ROUTES
-# ===========================
 
 @app.route('/shifts/<int:shift_id>/checkin', methods=['POST'])
 @jwt_required()
@@ -1066,10 +1048,6 @@ def approve_timesheet(timesheet_id):
         'timesheet': timesheet.to_dict()
     }), 200
 
-# =========================== 
-# CHAT ROUTES
-# ===========================
-
 @app.route('/shifts/<int:shift_id>/chat', methods=['GET', 'POST'])
 @jwt_required()
 def shift_chat(shift_id):
@@ -1123,10 +1101,6 @@ def shift_chat(shift_id):
         'chat_message': message.to_dict()
     }), 201
 
-# =========================== 
-# NOTIFICATION ROUTES
-# ===========================
-
 @app.route('/notifications', methods=['GET'])
 @jwt_required()
 def get_notifications():
@@ -1169,12 +1143,13 @@ def home():
         'version': '1.0.0',
         'status': 'running',
         'creator': 'Kanchan Ghosh (ikanchan.com)',
+        'note': 'Accepts requests with or without /api prefix',
         'endpoints': {
-            'health': '/health',
+            'health': '/health or /api/health',
             'auth': {
-                'register': 'POST /auth/register',
-                'login': 'POST /auth/login',
-                'me': 'GET /auth/me'
+                'register': 'POST /auth/register or /api/auth/register',
+                'login': 'POST /auth/login or /api/auth/login',
+                'me': 'GET /auth/me or /api/auth/me'
             },
             'worker': {
                 'search_shifts': 'GET /shifts/search',
