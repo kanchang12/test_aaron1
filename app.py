@@ -911,6 +911,22 @@ def login():
     if user.is_suspended:
         return jsonify({'error': 'Account suspended', 'reason': user.suspension_reason}), 403
 
+    # Ensure profile exists for the user's role
+    if user.role == UserRole.WORKER and not user.worker_profile:
+        worker_profile = WorkerProfile(
+            user_id=user.id,
+            referral_code=str(uuid.uuid4())[:8].upper()
+        )
+        db.session.add(worker_profile)
+    elif user.role == UserRole.VENUE and not user.venue_profile:
+        venue_profile = VenueProfile(
+            user_id=user.id,
+            venue_name=user.name or 'My Venue',
+            business_address='',
+            industry_type=''
+        )
+        db.session.add(venue_profile)
+
     # Update last login
     user.last_login = datetime.utcnow()
     db.session.commit()
