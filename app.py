@@ -62,6 +62,8 @@ os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'cvs'), exist_ok=True)
 # HELPER FUNCTIONS
 # ===========================
 
+app.config['APPLICATION_ROOT'] = '/api'
+
 def handle_referral_on_shift_complete(worker_user_id, shift_id):
     """Accumulate referral reward when referred user completes a shift."""
     referral = Referral.query.filter_by(referred_user_id=worker_user_id, status='active').first()
