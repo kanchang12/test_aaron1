@@ -169,13 +169,15 @@ class ApiService {
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       return List<Map<String, dynamic>>.from(data['shifts']);
+    } else if (response.statusCode == 401) {
+      throw Exception('Authentication failed. Please login again.');
     } else {
-      String details = response.body;
+      String details = 'Failed to load shifts';
       try {
         final data = jsonDecode(response.body);
-        details = data['error'] ?? data['message'] ?? response.body;
+        details = data['error'] ?? data['msg'] ?? data['message'] ?? details;
       } catch (_) {}
-      throw Exception('Failed to load shifts: ' + details);
+      throw Exception(details);
     }
   }
 
@@ -933,8 +935,15 @@ class ApiService {
 
     if (response.statusCode == 200) {
       return jsonDecode(response.body);
+    } else if (response.statusCode == 401) {
+      throw Exception('Authentication failed. Please login again.');
     } else {
-      throw Exception('Failed to load venue profile');
+      try {
+        final data = jsonDecode(response.body);
+        throw Exception(data['error'] ?? data['msg'] ?? 'Failed to load venue profile');
+      } catch (e) {
+        throw Exception('Failed to load venue profile');
+      }
     }
   }
 
@@ -957,9 +966,15 @@ class ApiService {
       }),
     );
 
-    if (response.statusCode != 200) {
-      final data = jsonDecode(response.body);
-      throw Exception(data['error'] ?? 'Failed to update profile');
+    if (response.statusCode == 401) {
+      throw Exception('Authentication failed. Please login again.');
+    } else if (response.statusCode != 200) {
+      try {
+        final data = jsonDecode(response.body);
+        throw Exception(data['error'] ?? data['msg'] ?? 'Failed to update profile');
+      } catch (e) {
+        throw Exception('Failed to update profile');
+      }
     }
   }
 }
