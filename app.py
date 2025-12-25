@@ -2,14 +2,14 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_bcrypt import Bcrypt
+from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-from models import *
 from sqlalchemy import func
 import os
 import stripe
 from werkzeug.utils import secure_filename
 import uuid
-import openai
+import enum
 
 app = Flask(__name__)
 
@@ -18,7 +18,6 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-pro
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-key-change-in-production')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=30)
 
-# Fix DATABASE_URL for Heroku (postgres:// -> postgresql://)
 database_url = os.getenv('DATABASE_URL', 'sqlite:///diisco.db')
 if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
@@ -35,36 +34,351 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 }
 
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# Initialize extensions
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "Accept"],
-        "expose_headers": ["Content-Type", "Authorization"]
-    }
-})
-
-db.init_app(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+db = SQLAlchemy(app)
 jwt = JWTManager(app)
 bcrypt = Bcrypt(app)
 
-# Stripe configuration
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY', 'sk_test_dummy')
 
-# Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'cvs'), exist_ok=True)
 
 # =========================== 
-# MIDDLEWARE
+# ENUMS
 # ===========================
 
+class UserRole(enum.Enum):
+    WORKER = 'worker'
+    VENUE = 'venue'
+    ADMIN = 'admin'
+
+class ShiftStatus(enum.Enum):
+    DRAFT = 'draft'
+    LIVE = 'live'
+    FILLED = 'filled'
+    IN_PROGRESS = 'in_progress'
+    COMPLETED = 'completed'
+    CANCELLED = 'cancelled'
+    DISPUTED = 'disputed'
+
+class ApplicationStatus(enum.Enum):
+    APPLIED = 'applied'
+    ACCEPTED = 'accepted'
+    REJECTED = 'rejected'
+    WITHDRAWN = 'withdrawn'
+
+class DisputeStatus(enum.Enum):
+    OPEN = 'open'
+    IN_REVIEW = 'in_review'
+    RESOLVED = 'resolved'
+    CLOSED = 'closed'
+
+class NotificationType(enum.Enum):
+    SHIFT_POSTED = 'shift_posted'
+    APPLICATION_UPDATE = 'application_update'
+    MESSAGE = 'message'
+    RATING = 'rating'
+    SYSTEM = 'system'
+
+# =========================== 
+# MODELS
+# ===========================
+
+class User(db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.Enum(UserRole), nullable=False)
+    name = db.Column(db.String(255), nullable=False)
+    phone = db.Column(db.String(50))
+    address = db.Column(db.Text)
+    bio = db.Column(db.Text)
+    profile_photo = db.Column(db.String(500))
+    is_active = db.Column(db.Boolean, default=True)
+    is_suspended = db.Column(db.Boolean, default=False)
+    email_verified = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    
+    worker_profile = db.relationship('WorkerProfile', backref='user_owner', uselist=False)
+    venue_profile = db.relationship('VenueProfile', backref='user_owner', uselist=False)
+    
+    def to_dict(self):
+        data = {
+            'id': self.id,
+            'email': self.email,
+            'role': self.role.value,
+            'name': self.name,
+            'phone': self.phone,
+            'address': self.address,
+            'bio': self.bio,
+            'is_active': self.is_active
+        }
+        if self.role == UserRole.WORKER and self.worker_profile:
+            data['worker_profile'] = self.worker_profile.to_dict()
+        elif self.role == UserRole.VENUE and self.venue_profile:
+            data['venue_profile'] = self.venue_profile.to_dict()
+        return data
+
+class WorkerProfile(db.Model):
+    __tablename__ = 'worker_profiles'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    cv_document = db.Column(db.String(500))
+    cv_summary = db.Column(db.Text)
+    average_rating = db.Column(db.Numeric(3, 2))
+    completed_shifts = db.Column(db.Integer, default=0)
+    reliability_score = db.Column(db.Numeric(5, 2))
+    referral_code = db.Column(db.String(20), unique=True)
+    referred_by = db.Column(db.String(20))
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'cv_summary': self.cv_summary,
+            'average_rating': float(self.average_rating) if self.average_rating else None,
+            'completed_shifts': self.completed_shifts,
+            'referral_code': self.referral_code
+        }
+
+class VenueProfile(db.Model):
+    __tablename__ = 'venue_profiles'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    venue_name = db.Column(db.String(255))
+    business_address = db.Column(db.Text)
+    industry_type = db.Column(db.String(100))
+    average_rating = db.Column(db.Numeric(3, 2))
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'venue_name': self.venue_name,
+            'business_address': self.business_address,
+            'industry_type': self.industry_type
+        }
+
+class Shift(db.Model):
+    __tablename__ = 'shifts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    venue_id = db.Column(db.Integer, db.ForeignKey('venue_profiles.id'), nullable=False)
+    role = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    start_time = db.Column(db.DateTime, nullable=False)
+    end_time = db.Column(db.DateTime, nullable=False)
+    location = db.Column(db.String(500))
+    hourly_rate = db.Column(db.Numeric(10, 2), nullable=False)
+    num_workers_needed = db.Column(db.Integer, default=1)
+    num_workers_hired = db.Column(db.Integer, default=0)
+    status = db.Column(db.Enum(ShiftStatus), default=ShiftStatus.DRAFT)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    venue = db.relationship('VenueProfile', backref='shifts')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'venue_id': self.venue_id,
+            'role': self.role,
+            'description': self.description,
+            'start_time': self.start_time.isoformat(),
+            'end_time': self.end_time.isoformat(),
+            'location': self.location,
+            'hourly_rate': float(self.hourly_rate),
+            'num_workers_needed': self.num_workers_needed,
+            'status': self.status.value
+        }
+
+class Application(db.Model):
+    __tablename__ = 'applications'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'), nullable=False)
+    worker_id = db.Column(db.Integer, db.ForeignKey('worker_profiles.id'), nullable=False)
+    status = db.Column(db.Enum(ApplicationStatus), default=ApplicationStatus.APPLIED)
+    offered_rate = db.Column(db.Numeric(10, 2))
+    hired_rate = db.Column(db.Numeric(10, 2))
+    cover_letter = db.Column(db.Text)
+    applied_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    shift = db.relationship('Shift', backref='applications')
+    worker = db.relationship('WorkerProfile', backref='applications')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'shift_id': self.shift_id,
+            'worker_id': self.worker_id,
+            'status': self.status.value,
+            'offered_rate': float(self.offered_rate) if self.offered_rate else None,
+            'applied_at': self.applied_at.isoformat()
+        }
+
+class Referral(db.Model):
+    __tablename__ = 'referrals'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    referrer_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    referred_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    referred_user_type = db.Column(db.String(20))
+    total_earned = db.Column(db.Numeric(10, 2), default=0)
+    shifts_completed = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(20), default='active')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class ReferralTransaction(db.Model):
+    __tablename__ = 'referral_transactions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    referral_id = db.Column(db.Integer, db.ForeignKey('referrals.id'))
+    amount = db.Column(db.Numeric(10, 2), nullable=False)
+    transaction_type = db.Column(db.String(20))
+    status = db.Column(db.String(20), default='pending')
+    payment_method = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class AvailabilitySlot(db.Model):
+    __tablename__ = 'availability_slots'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+    start_time = db.Column(db.Time)
+    end_time = db.Column(db.Time)
+    is_available = db.Column(db.Boolean, default=True)
+    reason = db.Column(db.String(255))
+    is_recurring = db.Column(db.Boolean, default=False)
+
+class Rating(db.Model):
+    __tablename__ = 'ratings'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'), nullable=False)
+    rater_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    rated_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    stars = db.Column(db.Numeric(2, 1), nullable=False)
+    comment = db.Column(db.Text)
+    tags = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Dispute(db.Model):
+    __tablename__ = 'disputes'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'), nullable=False)
+    reporter_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    dispute_type = db.Column(db.String(50), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    evidence_url = db.Column(db.String(500))
+    status = db.Column(db.Enum(DisputeStatus), default=DisputeStatus.OPEN)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'shift_id': self.shift_id,
+            'dispute_type': self.dispute_type,
+            'status': self.status.value
+        }
+
+class VenueTeamMember(db.Model):
+    __tablename__ = 'venue_team_members'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    venue_id = db.Column(db.Integer, db.ForeignKey('venue_profiles.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    email = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(50), nullable=False)
+    invited_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    is_active = db.Column(db.Boolean, default=False)
+    invited_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Timesheet(db.Model):
+    __tablename__ = 'timesheets'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'), nullable=False)
+    worker_id = db.Column(db.Integer, db.ForeignKey('worker_profiles.id'), nullable=False)
+    check_in_time = db.Column(db.DateTime)
+    check_out_time = db.Column(db.DateTime)
+    check_in_latitude = db.Column(db.Numeric(10, 8))
+    check_in_longitude = db.Column(db.Numeric(11, 8))
+    check_out_latitude = db.Column(db.Numeric(10, 8))
+    check_out_longitude = db.Column(db.Numeric(11, 8))
+    total_worked_minutes = db.Column(db.Integer)
+    status = db.Column(db.String(20), default='pending')
+    approved_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    approved_at = db.Column(db.DateTime)
+    worker_notes = db.Column(db.Text)
+    rejection_reason = db.Column(db.Text)
+    
+    shift = db.relationship('Shift', backref='timesheets')
+    worker = db.relationship('WorkerProfile', backref='timesheets')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'shift_id': self.shift_id,
+            'worker_id': self.worker_id,
+            'check_in_time': self.check_in_time.isoformat() if self.check_in_time else None,
+            'check_out_time': self.check_out_time.isoformat() if self.check_out_time else None,
+            'status': self.status
+        }
+
+class ChatMessage(db.Model):
+    __tablename__ = 'chat_messages'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'shift_id': self.shift_id,
+            'sender_id': self.sender_id,
+            'message': self.message,
+            'created_at': self.created_at.isoformat()
+        }
+
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    notification_type = db.Column(db.Enum(NotificationType))
+    shift_id = db.Column(db.Integer, db.ForeignKey('shifts.id'))
+    is_read = db.Column(db.Boolean, default=False)
+    read_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'message': self.message,
+            'is_read': self.is_read,
+            'created_at': self.created_at.isoformat()
+        }
+
+# MIDDLEWARE
 @app.before_request
 def handle_options():
-    """Handle OPTIONS preflight requests"""
     if request.method == 'OPTIONS':
         response = jsonify({'status': 'ok'})
         response.headers.add('Access-Control-Allow-Origin', '*')
@@ -72,42 +386,21 @@ def handle_options():
         response.headers.add('Access-Control-Allow-Methods', '*')
         return response, 200
 
-# =========================== 
-# DECORATOR TO REGISTER ROUTES WITH AND WITHOUT /api
-# ===========================
-
 def dual_route(rule, **options):
-    """Decorator that registers route both with and without /api prefix"""
     def decorator(f):
         endpoint = options.pop('endpoint', None) or f.__name__
         methods = options.pop('methods', ['GET'])
-        
-        # Register without /api prefix
         app.add_url_rule(rule, endpoint=endpoint, view_func=f, methods=methods, **options)
-        # Register with /api prefix
         app.add_url_rule(f'/api{rule}', endpoint=f'api_{endpoint}', view_func=f, methods=methods, **options)
         return f
     return decorator
 
-# =========================== 
-# HELPER FUNCTIONS
-# ===========================
-
 def handle_referral_on_shift_complete(worker_user_id, shift_id):
-    """Accumulate referral reward when referred user completes a shift."""
-    # Find referral for this worker
     referral = Referral.query.filter_by(referred_user_id=worker_user_id, status='active').first()
-    
     if referral:
-        # Increment shifts_completed
         referral.shifts_completed = (referral.shifts_completed or 0) + 1
-        
-        # Add £1 to referrer's balance
         referrer = User.query.get(referral.referrer_id)
-        if referrer and referrer.worker_profile:
-            referrer.worker_profile.referral_balance = (referrer.worker_profile.referral_balance or 0) + 1.0
-            
-            # Create transaction record
+        if referrer:
             transaction = ReferralTransaction(
                 user_id=referrer.id,
                 referral_id=referral.id,
@@ -126,7 +419,7 @@ def handle_referral_on_shift_complete(worker_user_id, shift_id):
 def register():
     """Register new user"""
     if request.method == 'GET':
-        return jsonify({'message': 'Use POST method to register', 'required_fields': ['email', 'password', 'role', 'name']}), 200
+        return jsonify({'message': 'Use POST method to register'}), 200
     
     data = request.get_json(force=True, silent=True) or {}
     
@@ -134,11 +427,9 @@ def register():
     if not all(field in data for field in required_fields):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    # Check if user exists
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 409
 
-    # Create user
     user = User(
         email=data['email'],
         password_hash=bcrypt.generate_password_hash(data['password']).decode('utf-8'),
@@ -150,9 +441,7 @@ def register():
     db.session.add(user)
     db.session.flush()
 
-    # Create role-specific profile
     if user.role == UserRole.WORKER:
-        # Generate unique referral code
         import random
         import string
         referral_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -163,8 +452,7 @@ def register():
             referred_by=data.get('referred_by')
         )
         db.session.add(profile)
-
-        # Create referral record if referred
+        
         if data.get('referral_code'):
             referrer_profile = WorkerProfile.query.filter_by(referral_code=data['referral_code']).first()
             if referrer_profile:
@@ -186,19 +474,14 @@ def register():
         db.session.add(profile)
 
     db.session.commit()
-
-    # Generate JWT token
     access_token = create_access_token(identity=str(user.id))
-    return jsonify({
-        'token': access_token,
-        'user': user.to_dict()
-    }), 201
+    return jsonify({'token': access_token, 'user': user.to_dict()}), 201
 
 @dual_route('/auth/login', methods=['POST', 'GET'])
 def login():
     """User login"""
     if request.method == 'GET':
-        return jsonify({'message': 'Use POST method to login', 'required_fields': ['email', 'password']}), 200
+        return jsonify({'message': 'Use POST to login'}), 200
     
     data = request.get_json(force=True, silent=True) or {}
     
@@ -213,16 +496,11 @@ def login():
     if not user.is_active:
         return jsonify({'error': 'Account is inactive'}), 403
 
-    # Update last login
     user.last_login = datetime.utcnow()
     db.session.commit()
 
-    # Generate token
     access_token = create_access_token(identity=str(user.id))
-    return jsonify({
-        'token': access_token,
-        'user': user.to_dict()
-    }), 200
+    return jsonify({'token': access_token, 'user': user.to_dict()}), 200
 
 @dual_route('/auth/me', methods=['GET'])
 @jwt_required()
@@ -234,15 +512,7 @@ def get_current_user():
     if not user:
         return jsonify({'error': 'User not found'}), 404
 
-    response = user.to_dict()
-    
-    # Add profile info
-    if user.role == UserRole.WORKER and user.worker_profile:
-        response['worker_profile'] = user.worker_profile.to_dict()
-    elif user.role == UserRole.VENUE and user.venue_profile:
-        response['venue_profile'] = user.venue_profile.to_dict()
-
-    return jsonify(response), 200
+    return jsonify(user.to_dict()), 200
 
 @dual_route('/auth/profile', methods=['PATCH', 'GET'])
 @jwt_required()
@@ -259,7 +529,6 @@ def update_user_profile():
 
     data = request.get_json(force=True, silent=True) or {}
 
-    # Update basic user fields
     if 'name' in data:
         user.name = data['name']
     if 'phone' in data:
@@ -269,7 +538,6 @@ def update_user_profile():
     if 'bio' in data:
         user.bio = data['bio']
 
-    # Update worker-specific fields
     if user.role == UserRole.WORKER and user.worker_profile:
         if 'cv_url' in data:
             user.worker_profile.cv_document = data['cv_url']
@@ -278,10 +546,7 @@ def update_user_profile():
 
     db.session.commit()
     
-    return jsonify({
-        'message': 'Profile updated successfully',
-        'user': user.to_dict()
-    }), 200
+    return jsonify({'message': 'Profile updated successfully', 'user': user.to_dict()}), 200
 
 # =========================== 
 # CV UPLOAD & PARSING
@@ -304,26 +569,20 @@ def upload_cv_file():
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
 
-    # Validate file type
     allowed_extensions = {'pdf', 'doc', 'docx'}
     if not ('.' in file.filename and file.filename.rsplit('.', 1)[1].lower() in allowed_extensions):
         return jsonify({'error': 'Invalid file type. Only PDF, DOC, DOCX allowed'}), 400
 
-    # Save file
     filename = secure_filename(f"cv_{user_id}_{uuid.uuid4()}.{file.filename.rsplit('.', 1)[1]}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], 'cvs', filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     file.save(filepath)
 
-    # Store CV URL in database
     cv_url = f"/uploads/cvs/{filename}"
     user.worker_profile.cv_document = cv_url
     db.session.commit()
 
-    return jsonify({
-        'cv_url': cv_url,
-        'message': 'CV uploaded successfully'
-    }), 200
+    return jsonify({'cv_url': cv_url, 'message': 'CV uploaded successfully'}), 200
 
 @dual_route('/worker/cv/parse', methods=['POST'])
 @jwt_required()
@@ -341,16 +600,12 @@ def parse_cv():
     if not cv_url:
         return jsonify({'error': 'CV URL required'}), 400
 
-    # Simple AI parsing (for production, use OpenAI GPT-4)
-    cv_summary = f"Experienced hospitality professional with 3+ years in bartending and serving roles. Skilled in customer service, cocktail preparation, and high-volume environments."
+    cv_summary = "Experienced hospitality professional with 3+ years in bartending and serving roles."
 
     user.worker_profile.cv_summary = cv_summary
     db.session.commit()
 
-    return jsonify({
-        'summary': cv_summary,
-        'message': 'CV parsed successfully'
-    }), 200
+    return jsonify({'summary': cv_summary, 'message': 'CV parsed successfully'}), 200
 
 # =========================== 
 # AVAILABILITY CALENDAR
@@ -367,7 +622,6 @@ def manage_availability():
         return jsonify({'error': 'Not a worker account'}), 403
 
     if request.method == 'GET':
-        # Get availability slots
         availability = AvailabilitySlot.query.filter_by(user_id=user_id).all()
         return jsonify({
             'availability': [{
@@ -382,7 +636,6 @@ def manage_availability():
             } for slot in availability]
         }), 200
 
-    # POST - Set availability
     data = request.get_json(force=True, silent=True) or {}
     date_str = data.get('date')
     is_available = data.get('is_available', True)
@@ -392,7 +645,6 @@ def manage_availability():
 
     date_obj = datetime.fromisoformat(date_str).date()
 
-    # Check if slot exists
     slot = AvailabilitySlot.query.filter_by(user_id=user_id, date=date_obj).first()
     
     if slot:
@@ -446,7 +698,6 @@ def get_referrals():
             'status': ref.status,
             'created_at': ref.created_at.isoformat() if ref.created_at else None
         } for ref in referrals],
-        'referral_balance': float(user.worker_profile.referral_balance or 0) if user.worker_profile else 0,
         'referral_code': user.worker_profile.referral_code if user.worker_profile else None
     }), 200
 
@@ -466,10 +717,6 @@ def withdraw_referral_earnings():
     if amount <= 0:
         return jsonify({'error': 'Invalid amount'}), 400
 
-    if not user.worker_profile or (user.worker_profile.referral_balance or 0) < amount:
-        return jsonify({'error': 'Insufficient balance'}), 400
-
-    # Create withdrawal transaction
     transaction = ReferralTransaction(
         user_id=user_id,
         amount=amount,
@@ -478,15 +725,11 @@ def withdraw_referral_earnings():
         payment_method=data.get('payment_method', 'stripe')
     )
     db.session.add(transaction)
-
-    # Deduct from balance
-    user.worker_profile.referral_balance -= amount
     db.session.commit()
 
     return jsonify({
         'message': 'Withdrawal initiated',
-        'transaction_id': transaction.id,
-        'new_balance': float(user.worker_profile.referral_balance)
+        'transaction_id': transaction.id
     }), 201
 
 # =========================== 
@@ -501,18 +744,15 @@ def handle_shifts():
     user = User.query.get(user_id)
 
     if request.method == 'GET':
-        # Venue: Get their posted shifts
         if user.role == UserRole.VENUE:
             shifts = Shift.query.filter_by(venue_id=user.venue_profile.id).all()
         else:
-            # Workers: Get all available shifts
             shifts = Shift.query.filter_by(status=ShiftStatus.LIVE).all()
 
         return jsonify({
             'shifts': [shift.to_dict() for shift in shifts]
         }), 200
 
-    # POST - Create shift (venues only)
     if user.role != UserRole.VENUE:
         return jsonify({'error': 'Only venues can create shifts'}), 403
 
@@ -531,7 +771,6 @@ def handle_shifts():
         location=data.get('location', user.venue_profile.business_address),
         hourly_rate=float(data['hourly_rate']),
         num_workers_needed=data.get('num_workers_needed', 1),
-        required_skills=data.get('required_skills', []),
         status=ShiftStatus.LIVE
     )
     db.session.add(shift)
@@ -552,15 +791,12 @@ def search_shifts():
     if user.role != UserRole.WORKER:
         return jsonify({'error': 'Only workers can search shifts'}), 403
 
-    # Get query parameters
     role = request.args.get('role')
     start_date = request.args.get('start_date')
     location = request.args.get('location')
 
-    # Base query
     query = Shift.query.filter_by(status=ShiftStatus.LIVE)
 
-    # Apply filters
     if role:
         query = query.filter(Shift.role.ilike(f'%{role}%'))
     if start_date:
@@ -588,7 +824,6 @@ def handle_shift(shift_id):
     if request.method == 'GET':
         return jsonify(shift.to_dict()), 200
 
-    # PUT and DELETE are venue-only
     if user.role != UserRole.VENUE or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Not authorized'}), 403
 
@@ -634,7 +869,6 @@ def apply_to_shift(shift_id):
     if not shift:
         return jsonify({'error': 'Shift not found'}), 404
 
-    # Check if already applied
     existing = Application.query.filter_by(
         shift_id=shift_id,
         worker_id=user.worker_profile.id
@@ -719,7 +953,6 @@ def hire_worker(application_id):
     application.status = ApplicationStatus.ACCEPTED
     application.hired_rate = data.get('hired_rate', application.offered_rate)
 
-    # Update shift
     shift.num_workers_hired += 1
     if shift.num_workers_hired >= shift.num_workers_needed:
         shift.status = ShiftStatus.FILLED
@@ -749,25 +982,21 @@ def get_smart_matches(shift_id):
     if not shift or shift.venue_id != user.venue_profile.id:
         return jsonify({'error': 'Shift not found'}), 404
 
-    # Simple matching algorithm
     workers = WorkerProfile.query.join(User).filter(
         User.is_active == True,
         User.is_suspended == False
     ).all()
 
     matches = []
-    for worker in workers[:10]:  # Top 10 matches
-        # Calculate match score (simplified)
-        match_score = 75.0  # Base score
+    for worker in workers[:10]:
+        match_score = 75.0
         accept_likelihood = 65.0
         match_reason = f"Experienced {shift.role}"
 
-        # Boost score if high reliability
         if worker.reliability_score and worker.reliability_score > 90:
             match_score += 15
             match_reason += ", excellent reliability"
 
-        # Boost if worked at this venue before
         past_shifts = Application.query.filter_by(
             worker_id=worker.id,
             status=ApplicationStatus.ACCEPTED
@@ -794,7 +1023,6 @@ def get_smart_matches(shift_id):
             }
         })
 
-    # Sort by match score
     matches.sort(key=lambda x: x['match_score'], reverse=True)
 
     return jsonify({'matches': matches}), 200
@@ -823,7 +1051,6 @@ def invite_worker_to_shift(shift_id):
     if not worker_user or worker_user.role != UserRole.WORKER:
         return jsonify({'error': 'Worker not found'}), 404
 
-    # Create notification/invitation
     notification = Notification(
         user_id=worker_id,
         title='Shift Invitation',
@@ -847,7 +1074,6 @@ def invite_worker_to_shift(shift_id):
 def create_rating():
     """Create a rating"""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
     
     data = request.get_json(force=True, silent=True) or {}
     required = ['shift_id', 'rated_user_id', 'stars']
@@ -859,11 +1085,9 @@ def create_rating():
     rated_user_id = data['rated_user_id']
     stars = float(data['stars'])
 
-    # Validate rating value
     if not (1 <= stars <= 5):
         return jsonify({'error': 'Rating must be between 1 and 5'}), 400
 
-    # Check if already rated
     existing = Rating.query.filter_by(
         shift_id=shift_id,
         rater_id=user_id,
@@ -883,7 +1107,6 @@ def create_rating():
     )
     db.session.add(rating)
 
-    # Update average rating for rated user
     rated_user = User.query.get(rated_user_id)
     if rated_user:
         avg_rating = db.session.query(func.avg(Rating.stars)).filter_by(
@@ -944,7 +1167,6 @@ def handle_disputes():
             'disputes': [dispute.to_dict() for dispute in disputes]
         }), 200
 
-    # POST - Create dispute
     data = request.get_json(force=True, silent=True) or {}
     required = ['shift_id', 'dispute_type', 'description']
     
@@ -1012,7 +1234,6 @@ def invite_team_member():
     if not all(field in data for field in required):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    # Check if already invited
     existing = VenueTeamMember.query.filter_by(
         venue_id=user.venue_profile.id,
         email=data['email']
@@ -1065,7 +1286,6 @@ def checkin_shift(shift_id):
     )
     db.session.add(timesheet)
 
-    # Update shift status
     shift.status = ShiftStatus.IN_PROGRESS
     db.session.commit()
 
@@ -1095,7 +1315,6 @@ def checkout_shift(timesheet_id):
     timesheet.check_out_longitude = data.get('longitude')
     timesheet.worker_notes = data.get('notes')
 
-    # Calculate worked time
     worked = timesheet.check_out_time - timesheet.check_in_time
     timesheet.total_worked_minutes = int(worked.total_seconds() / 60)
     timesheet.status = 'pending'
@@ -1124,7 +1343,7 @@ def approve_timesheet(timesheet_id):
         return jsonify({'error': 'Not authorized'}), 403
 
     data = request.get_json(force=True, silent=True) or {}
-    action = data.get('action')  # 'approve' or 'query'
+    action = data.get('action')
 
     if action == 'approve':
         timesheet.status = 'approved'
@@ -1132,11 +1351,9 @@ def approve_timesheet(timesheet_id):
         timesheet.approved_at = datetime.utcnow()
         shift.status = ShiftStatus.COMPLETED
 
-        # Update worker stats
         worker = timesheet.worker
         worker.completed_shifts += 1
 
-        # Handle referral rewards
         handle_referral_on_shift_complete(worker.user_id, shift.id)
 
     elif action == 'query':
@@ -1167,7 +1384,6 @@ def shift_chat(shift_id):
         return jsonify({'error': 'Shift not found'}), 404
 
     if request.method == 'GET':
-        # Get messages
         messages = ChatMessage.query.filter_by(shift_id=shift_id).filter(
             db.or_(
                 ChatMessage.sender_id == user_id,
@@ -1179,16 +1395,13 @@ def shift_chat(shift_id):
             'messages': [m.to_dict() for m in messages]
         }), 200
 
-    # POST - Send message
     data = request.get_json(force=True, silent=True) or {}
     if not data.get('message'):
         return jsonify({'error': 'Message required'}), 400
 
-    # Determine receiver
     if user.role == UserRole.WORKER:
         receiver_id = shift.venue.user_id
     else:
-        # Find the worker
         app = Application.query.filter_by(
             shift_id=shift_id,
             status=ApplicationStatus.ACCEPTED
@@ -1257,30 +1470,7 @@ def home():
         'name': 'Diisco API',
         'version': '1.0.0',
         'status': 'running',
-        'creator': 'Kanchan Ghosh (ikanchan.com)',
-        'note': 'All routes work with both /path and /api/path',
-        'endpoints': {
-            'health': '/health or /api/health',
-            'auth': {
-                'register': 'POST /auth/register or /api/auth/register',
-                'login': 'POST /auth/login or /api/auth/login',
-                'me': 'GET /auth/me or /api/auth/me'
-            },
-            'worker': {
-                'search_shifts': 'GET /shifts/search',
-                'apply': 'POST /shifts/{id}/apply',
-                'applications': 'GET /worker/applications',
-                'availability': 'GET/POST /worker/availability',
-                'referrals': 'GET /referrals'
-            },
-            'venue': {
-                'shifts': 'GET /shifts',
-                'create_shift': 'POST /shifts',
-                'applications': 'GET /shifts/{id}/applications',
-                'hire': 'POST /applications/{id}/hire',
-                'smart_matches': 'GET /shifts/{id}/matches'
-            }
-        }
+        'creator': 'Kanchan Ghosh (ikanchan.com)'
     }), 200
 
 @app.route('/health', methods=['GET'])
@@ -1293,77 +1483,62 @@ def health():
         'database': 'connected'
     }), 200
 
-# =========================== 
-# DATABASE INITIALIZATION
-# ===========================
-
-@app.cli.command('init-db')
-def init_db():
-    """Initialize the database"""
-    with app.app_context():
+@app.route('/reset-db', methods=['GET'])
+def reset_db():
+    """Reset database - visit this URL"""
+    try:
+        db.drop_all()
         db.create_all()
-        print("✅ Database initialized!")
-
-@app.cli.command('seed-db')
-def seed_db():
-    """Seed database with sample data"""
-    with app.app_context():
-        # Create sample venue
+        
         venue_user = User(
             email='venue@test.com',
             password_hash=bcrypt.generate_password_hash('password123').decode('utf-8'),
             role=UserRole.VENUE,
             name='Test Manager',
-            email_verified=True,
             is_active=True
         )
         db.session.add(venue_user)
         db.session.flush()
-
+        
         venue_profile = VenueProfile(
             user_id=venue_user.id,
             venue_name='The Golden Bar',
-            business_address='123 Main St, Leeds',
-            industry_type='Bar'
+            business_address='123 Main St, Leeds'
         )
         db.session.add(venue_profile)
-
-        # Create sample worker
+        
         worker_user = User(
             email='worker@test.com',
             password_hash=bcrypt.generate_password_hash('password123').decode('utf-8'),
             role=UserRole.WORKER,
             name='John Worker',
-            email_verified=True,
             is_active=True
         )
         db.session.add(worker_user)
         db.session.flush()
-
+        
         worker_profile = WorkerProfile(
             user_id=worker_user.id,
             referral_code='JOHN123'
         )
         db.session.add(worker_profile)
-
-        # Create admin
-        admin_user = User(
-            email='admin@diisco.app',
-            password_hash=bcrypt.generate_password_hash('admin123').decode('utf-8'),
-            role=UserRole.ADMIN,
-            name='Admin User',
-            email_verified=True,
-            is_active=True
-        )
-        db.session.add(admin_user)
-
+        
         db.session.commit()
         
-        print("✅ Database seeded!")
-        print("\n📝 Test Accounts:")
-        print("  Worker: worker@test.com / password123")
-        print("  Venue: venue@test.com / password123")
-        print("  Admin: admin@diisco.app / admin123")
+        return jsonify({
+            'status': 'SUCCESS',
+            'message': 'Database reset complete!',
+            'test_accounts': {
+                'worker': 'worker@test.com / password123',
+                'venue': 'venue@test.com / password123'
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'status': 'ERROR',
+            'error': str(e)
+        }), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
