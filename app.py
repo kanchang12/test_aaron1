@@ -57,17 +57,21 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'cvs'), exist_ok=True)
 
 # =========================== 
-# MIDDLEWARE: Strip /api prefix
+# DECORATOR TO REGISTER ROUTES WITH AND WITHOUT /api
 # ===========================
 
-@app.before_request
-def strip_api_prefix():
-    """Handle both /api/path and /path routes"""
-    if request.path.startswith('/api/'):
-        # Store the original path
-        request.environ['ORIGINAL_PATH'] = request.path
-        # Rewrite the path without /api
-        request.environ['PATH_INFO'] = request.path[4:]
+def dual_route(rule, **options):
+    """Decorator that registers route both with and without /api prefix"""
+    def decorator(f):
+        endpoint = options.pop('endpoint', None) or f.__name__
+        methods = options.pop('methods', ['GET'])
+        
+        # Register without /api prefix
+        app.add_url_rule(rule, endpoint=endpoint, view_func=f, methods=methods, **options)
+        # Register with /api prefix
+        app.add_url_rule(f'/api{rule}', endpoint=f'api_{endpoint}', view_func=f, methods=methods, **options)
+        return f
+    return decorator
 
 # =========================== 
 # HELPER FUNCTIONS
@@ -98,7 +102,7 @@ def handle_referral_on_shift_complete(worker_user_id, shift_id):
 # AUTHENTICATION ROUTES
 # ===========================
 
-@app.route('/auth/register', methods=['POST'])
+@dual_route('/auth/register', methods=['POST'])
 def register():
     """Register new user"""
     data = request.get_json()
@@ -161,7 +165,7 @@ def register():
         'user': user.to_dict()
     }), 201
 
-@app.route('/auth/login', methods=['POST'])
+@dual_route('/auth/login', methods=['POST'])
 def login():
     """User login"""
     data = request.get_json()
@@ -186,7 +190,7 @@ def login():
         'user': user.to_dict()
     }), 200
 
-@app.route('/auth/me', methods=['GET'])
+@dual_route('/auth/me', methods=['GET'])
 @jwt_required()
 def get_current_user():
     """Get current user details"""
@@ -205,7 +209,7 @@ def get_current_user():
 
     return jsonify(response), 200
 
-@app.route('/auth/profile', methods=['PATCH'])
+@dual_route('/auth/profile', methods=['PATCH'])
 @jwt_required()
 def update_user_profile():
     """Update user profile"""
@@ -243,7 +247,7 @@ def update_user_profile():
 # CV UPLOAD & PARSING
 # ===========================
 
-@app.route('/worker/cv/upload', methods=['POST'])
+@dual_route('/worker/cv/upload', methods=['POST'])
 @jwt_required()
 def upload_cv_file():
     """Upload CV file"""
@@ -278,7 +282,7 @@ def upload_cv_file():
         'message': 'CV uploaded successfully'
     }), 200
 
-@app.route('/worker/cv/parse', methods=['POST'])
+@dual_route('/worker/cv/parse', methods=['POST'])
 @jwt_required()
 def parse_cv():
     """Parse CV using AI to extract summary"""
@@ -294,7 +298,7 @@ def parse_cv():
     if not cv_url:
         return jsonify({'error': 'CV URL required'}), 400
 
-    cv_summary = f"Experienced hospitality professional with 3+ years in bartending and serving roles. Skilled in customer service, cocktail preparation, and high-volume environments."
+    cv_summary = f"Experienced hospitality professional with 3+ years in bartending and serving roles."
 
     user.worker_profile.cv_summary = cv_summary
     db.session.commit()
@@ -308,7 +312,7 @@ def parse_cv():
 # AVAILABILITY CALENDAR
 # ===========================
 
-@app.route('/worker/availability', methods=['GET', 'POST'])
+@dual_route('/worker/availability', methods=['GET', 'POST'])
 @jwt_required()
 def manage_availability():
     """Get or set worker availability"""
@@ -372,7 +376,7 @@ def manage_availability():
 # REFERRAL SYSTEM
 # ===========================
 
-@app.route('/referrals', methods=['GET'])
+@dual_route('/referrals', methods=['GET'])
 @jwt_required()
 def get_referrals():
     """Get user's referrals"""
@@ -399,7 +403,7 @@ def get_referrals():
         'referral_code': user.worker_profile.referral_code if user.worker_profile else None
     }), 200
 
-@app.route('/referrals/withdraw', methods=['POST'])
+@dual_route('/referrals/withdraw', methods=['POST'])
 @jwt_required()
 def withdraw_referral_earnings():
     """Withdraw referral earnings"""
@@ -440,7 +444,7 @@ def withdraw_referral_earnings():
 # SHIFT ROUTES
 # ===========================
 
-@app.route('/shifts', methods=['GET', 'POST'])
+@dual_route('/shifts', methods=['GET', 'POST'])
 @jwt_required()
 def handle_shifts():
     """Get shifts or create new shift"""
@@ -486,7 +490,7 @@ def handle_shifts():
         'shift': shift.to_dict()
     }), 201
 
-@app.route('/shifts/search', methods=['GET'])
+@dual_route('/shifts/search', methods=['GET'])
 @jwt_required()
 def search_shifts():
     """Search for shifts"""
@@ -515,7 +519,7 @@ def search_shifts():
         'shifts': [shift.to_dict() for shift in shifts]
     }), 200
 
-@app.route('/shifts/<int:shift_id>', methods=['GET', 'PUT', 'DELETE'])
+@dual_route('/shifts/<int:shift_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 def handle_shift(shift_id):
     """Get, update, or delete specific shift"""
@@ -556,7 +560,7 @@ def handle_shift(shift_id):
         db.session.commit()
         return jsonify({'message': 'Shift deleted'}), 200
 
-@app.route('/shifts/<int:shift_id>/apply', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/apply', methods=['POST'])
 @jwt_required()
 def apply_to_shift(shift_id):
     """Apply to a shift"""
@@ -595,7 +599,7 @@ def apply_to_shift(shift_id):
         'application': application.to_dict()
     }), 201
 
-@app.route('/worker/applications', methods=['GET'])
+@dual_route('/worker/applications', methods=['GET'])
 @jwt_required()
 def get_worker_applications():
     """Get worker's applications"""
@@ -613,7 +617,7 @@ def get_worker_applications():
         'applications': [app.to_dict() for app in applications]
     }), 200
 
-@app.route('/shifts/<int:shift_id>/applications', methods=['GET'])
+@dual_route('/shifts/<int:shift_id>/applications', methods=['GET'])
 @jwt_required()
 def get_shift_applications(shift_id):
     """Get applications for a shift"""
@@ -633,7 +637,7 @@ def get_shift_applications(shift_id):
         'applications': [app.to_dict() for app in applications]
     }), 200
 
-@app.route('/applications/<int:application_id>/hire', methods=['POST'])
+@dual_route('/applications/<int:application_id>/hire', methods=['POST'])
 @jwt_required()
 def hire_worker(application_id):
     """Accept an application and hire worker"""
@@ -665,7 +669,7 @@ def hire_worker(application_id):
         'application': application.to_dict()
     }), 200
 
-@app.route('/shifts/<int:shift_id>/matches', methods=['GET'])
+@dual_route('/shifts/<int:shift_id>/matches', methods=['GET'])
 @jwt_required()
 def get_smart_matches(shift_id):
     """Get smart-matched workers for a shift"""
@@ -724,7 +728,7 @@ def get_smart_matches(shift_id):
 
     return jsonify({'matches': matches}), 200
 
-@app.route('/shifts/<int:shift_id>/invite', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/invite', methods=['POST'])
 @jwt_required()
 def invite_worker_to_shift(shift_id):
     """Invite specific worker to a shift"""
@@ -760,12 +764,11 @@ def invite_worker_to_shift(shift_id):
 
     return jsonify({'message': 'Invitation sent successfully'}), 201
 
-@app.route('/ratings', methods=['POST'])
+@dual_route('/ratings', methods=['POST'])
 @jwt_required()
 def create_rating():
     """Create a rating"""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
     
     data = request.get_json()
     required = ['shift_id', 'rated_user_id', 'stars']
@@ -817,7 +820,7 @@ def create_rating():
         'rating_id': rating.id
     }), 201
 
-@app.route('/users/<int:user_id>/ratings', methods=['GET'])
+@dual_route('/users/<int:user_id>/ratings', methods=['GET'])
 @jwt_required()
 def get_user_ratings(user_id):
     """Get ratings for a user"""
@@ -838,7 +841,7 @@ def get_user_ratings(user_id):
         } for r in ratings]
     }), 200
 
-@app.route('/disputes', methods=['GET', 'POST'])
+@dual_route('/disputes', methods=['GET', 'POST'])
 @jwt_required()
 def handle_disputes():
     """Get or create disputes"""
@@ -877,7 +880,7 @@ def handle_disputes():
         'dispute': dispute.to_dict()
     }), 201
 
-@app.route('/venues/team', methods=['GET'])
+@dual_route('/venues/team', methods=['GET'])
 @jwt_required()
 def get_venue_team():
     """Get venue team members"""
@@ -902,7 +905,7 @@ def get_venue_team():
         } for member in team_members]
     }), 200
 
-@app.route('/venues/team/invite', methods=['POST'])
+@dual_route('/venues/team/invite', methods=['POST'])
 @jwt_required()
 def invite_team_member():
     """Invite team member to venue"""
@@ -941,7 +944,7 @@ def invite_team_member():
         'invitation_id': team_member.id
     }), 201
 
-@app.route('/shifts/<int:shift_id>/checkin', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/checkin', methods=['POST'])
 @jwt_required()
 def checkin_shift(shift_id):
     """Check in to shift"""
@@ -974,7 +977,7 @@ def checkin_shift(shift_id):
         'timesheet': timesheet.to_dict()
     }), 201
 
-@app.route('/timesheets/<int:timesheet_id>/checkout', methods=['POST'])
+@dual_route('/timesheets/<int:timesheet_id>/checkout', methods=['POST'])
 @jwt_required()
 def checkout_shift(timesheet_id):
     """Check out from shift"""
@@ -1006,7 +1009,7 @@ def checkout_shift(timesheet_id):
         'timesheet': timesheet.to_dict()
     }), 200
 
-@app.route('/timesheets/<int:timesheet_id>/approve', methods=['POST'])
+@dual_route('/timesheets/<int:timesheet_id>/approve', methods=['POST'])
 @jwt_required()
 def approve_timesheet(timesheet_id):
     """Approve or query timesheet"""
@@ -1048,7 +1051,7 @@ def approve_timesheet(timesheet_id):
         'timesheet': timesheet.to_dict()
     }), 200
 
-@app.route('/shifts/<int:shift_id>/chat', methods=['GET', 'POST'])
+@dual_route('/shifts/<int:shift_id>/chat', methods=['GET', 'POST'])
 @jwt_required()
 def shift_chat(shift_id):
     """Get or send chat messages for a shift"""
@@ -1101,7 +1104,7 @@ def shift_chat(shift_id):
         'chat_message': message.to_dict()
     }), 201
 
-@app.route('/notifications', methods=['GET'])
+@dual_route('/notifications', methods=['GET'])
 @jwt_required()
 def get_notifications():
     """Get user notifications"""
@@ -1115,7 +1118,7 @@ def get_notifications():
         'notifications': [n.to_dict() for n in notifications]
     }), 200
 
-@app.route('/notifications/<int:notification_id>/read', methods=['POST'])
+@dual_route('/notifications/<int:notification_id>/read', methods=['POST'])
 @jwt_required()
 def mark_notification_read(notification_id):
     """Mark notification as read"""
@@ -1143,32 +1146,19 @@ def home():
         'version': '1.0.0',
         'status': 'running',
         'creator': 'Kanchan Ghosh (ikanchan.com)',
-        'note': 'Accepts requests with or without /api prefix',
+        'note': 'All routes accept both /path and /api/path formats',
         'endpoints': {
             'health': '/health or /api/health',
             'auth': {
-                'register': 'POST /auth/register or /api/auth/register',
-                'login': 'POST /auth/login or /api/auth/login',
-                'me': 'GET /auth/me or /api/auth/me'
-            },
-            'worker': {
-                'search_shifts': 'GET /shifts/search',
-                'apply': 'POST /shifts/{id}/apply',
-                'applications': 'GET /worker/applications',
-                'availability': 'GET/POST /worker/availability',
-                'referrals': 'GET /referrals'
-            },
-            'venue': {
-                'shifts': 'GET /shifts',
-                'create_shift': 'POST /shifts',
-                'applications': 'GET /shifts/{id}/applications',
-                'hire': 'POST /applications/{id}/hire',
-                'smart_matches': 'GET /shifts/{id}/matches'
+                'register': 'POST /auth/register',
+                'login': 'POST /auth/login',
+                'me': 'GET /auth/me'
             }
         }
     }), 200
 
 @app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({
@@ -1241,10 +1231,6 @@ def seed_db():
         db.session.commit()
         
         print("✅ Database seeded!")
-        print("\n📝 Test Accounts:")
-        print("  Worker: worker@test.com / password123")
-        print("  Venue: venue@test.com / password123")
-        print("  Admin: admin@diisco.app / admin123")
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
