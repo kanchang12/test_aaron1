@@ -114,10 +114,10 @@ class User(db.Model):
             'email': self.email,
             'role': self.role.value,
             'name': self.name,
-            'phone': self.phone or '',
-            'address': self.address or '',
-            'bio': self.bio or '',
-            'profile_photo': self.profile_photo or '',
+            'phone': self.phone if self.phone else '',
+            'address': self.address if self.address else '',
+            'bio': self.bio if self.bio else '',
+            'profile_photo': self.profile_photo if self.profile_photo else '',
             'is_active': self.is_active
         }
         if self.role == UserRole.WORKER and self.worker_profile:
@@ -143,15 +143,15 @@ class WorkerProfile(db.Model):
         return {
             'id': self.id,
             'user_id': self.user_id,
-            'cv_document': self.cv_document or '',
-            'cv_summary': self.cv_summary or '',
+            'cv_document': self.cv_document if self.cv_document else '',
+            'cv_summary': self.cv_summary if self.cv_summary else '',
             'average_rating': float(self.average_rating) if self.average_rating else 0.0,
-            'completed_shifts': self.completed_shifts or 0,
+            'completed_shifts': self.completed_shifts if self.completed_shifts else 0,
             'reliability_score': float(self.reliability_score) if self.reliability_score else 0.0,
-            'referral_code': self.referral_code or '',
-            'referred_by': self.referred_by or ''
+            'referral_code': self.referral_code if self.referral_code else '',
+            'referred_by': self.referred_by if self.referred_by else ''
         }
-        
+
 class VenueProfile(db.Model):
     __tablename__ = 'venue_profiles'
     
@@ -162,14 +162,13 @@ class VenueProfile(db.Model):
     industry_type = db.Column(db.String(100))
     average_rating = db.Column(db.Numeric(3, 2))
     
-    
     def to_dict(self):
         return {
             'id': self.id,
             'user_id': self.user_id,
-            'venue_name': self.venue_name or '',
-            'business_address': self.business_address or '',
-            'industry_type': self.industry_type or '',
+            'venue_name': self.venue_name if self.venue_name else '',
+            'business_address': self.business_address if self.business_address else '',
+            'industry_type': self.industry_type if self.industry_type else '',
             'average_rating': float(self.average_rating) if self.average_rating else 0.0
         }
 
