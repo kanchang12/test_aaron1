@@ -141,17 +141,31 @@ class WorkerProfile(db.Model):
     
     
     def to_dict(self):
-        return {
+        
+        data = {
             'id': self.id,
-            'user_id': self.user_id,
-            'cv_document': self.cv_document or '',
-            'cv_summary': self.cv_summary or '',
-            'average_rating': float(self.average_rating) if self.average_rating else 0.0,
-            'completed_shifts': self.completed_shifts or 0,
-            'reliability_score': float(self.reliability_score) if self.reliability_score else 0.0,
-            'referral_code': self.referral_code or ''
+            'email': self.email,
+            'role': self.role.value,
+            'name': self.name,
+            'is_active': self.is_active
         }
-
+        
+        # Only add optional fields if they exist
+        if self.phone:
+            data['phone'] = self.phone
+        if self.address:
+            data['address'] = self.address
+        if self.bio:
+            data['bio'] = self.bio
+        if self.profile_photo:
+            data['profile_photo'] = self.profile_photo
+        
+        if self.role == UserRole.WORKER and self.worker_profile:
+            data['worker_profile'] = self.worker_profile.to_dict()
+        elif self.role == UserRole.VENUE and self.venue_profile:
+            data['venue_profile'] = self.venue_profile.to_dict()
+        
+        return data
 class VenueProfile(db.Model):
     __tablename__ = 'venue_profiles'
     
@@ -506,7 +520,12 @@ def login():
     db.session.commit()
 
     access_token = create_access_token(identity=str(user.id))
-    return jsonify({'token': access_token, 'user': user.to_dict()}), 200
+    
+    # Return minimal response - only what exists
+    return jsonify({
+        'token': access_token,
+        'user': user.to_dict()
+    }), 200
 
 @dual_route('/auth/me', methods=['GET'])
 @jwt_required()
