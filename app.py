@@ -1493,9 +1493,27 @@ def health():
 def reset_db():
     """Reset database - visit this URL"""
     try:
-        db.drop_all()
+        # Drop tables in correct order (reverse of dependencies)
+        db.session.execute(db.text('DROP TABLE IF EXISTS chat_messages CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS notifications CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS timesheets CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS ratings CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS disputes CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS venue_team_members CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS referral_transactions CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS referrals CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS availability_slots CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS applications CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS shifts CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS worker_profiles CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS venue_profiles CASCADE'))
+        db.session.execute(db.text('DROP TABLE IF EXISTS users CASCADE'))
+        db.session.commit()
+        
+        # Now create all tables
         db.create_all()
         
+        # Create test data
         venue_user = User(
             email='venue@test.com',
             password_hash=bcrypt.generate_password_hash('password123').decode('utf-8'),
