@@ -198,7 +198,7 @@ class ApiService {
     double? counterRate,
   }) async {
     final response = await http.post(
-      Uri.parse('$baseUrl/shifts/$shiftId/apply'),
+      Uri.parse('$baseUrl/api/shifts/$shiftId/apply'),
       headers: await getHeaders(),
       body: jsonEncode({
         if (counterRate != null) 'counter_rate': counterRate,
@@ -921,6 +921,45 @@ class ApiService {
     if (response.statusCode != 200) {
       final data = jsonDecode(response.body);
       throw Exception(data['error'] ?? 'Failed to update email');
+    }
+  }
+
+  // Venue Profile Methods
+  Future<Map<String, dynamic>> getVenueProfile() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/venue/profile'),
+      headers: await getHeaders(),
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else {
+      throw Exception('Failed to load venue profile');
+    }
+  }
+
+  Future<void> updateVenueProfile({
+    String? venueName,
+    String? businessAddress,
+    String? industryType,
+    String? contactEmail,
+    String? contactPhone,
+  }) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/api/venue/profile'),
+      headers: await getHeaders(),
+      body: jsonEncode({
+        if (venueName != null) 'venue_name': venueName,
+        if (businessAddress != null) 'business_address': businessAddress,
+        if (industryType != null) 'industry_type': industryType,
+        if (contactEmail != null) 'contact_email': contactEmail,
+        if (contactPhone != null) 'contact_phone': contactPhone,
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      final data = jsonDecode(response.body);
+      throw Exception(data['error'] ?? 'Failed to update profile');
     }
   }
 }

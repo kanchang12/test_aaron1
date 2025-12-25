@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import '../../services/api_service.dart';
 import '../../models/models.dart';
 import '../auth/login_screen.dart';
+import 'edit_venue_profile_screen.dart';
 
 class VenueHomeScreen extends StatefulWidget {
   const VenueHomeScreen({super.key});
@@ -670,17 +671,10 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Edit Venue Profile'),
               subtitle: const Text('Update venue name, address, contact info'),
               onTap: () {
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Edit Venue Profile'),
-                    content: const Text('This feature is coming soon!'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context),
-                        child: const Text('OK'),
-                      ),
-                    ],
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const EditVenueProfileScreen(),
                   ),
                 );
               },
