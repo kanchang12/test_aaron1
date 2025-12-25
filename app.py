@@ -114,9 +114,10 @@ class User(db.Model):
             'email': self.email,
             'role': self.role.value,
             'name': self.name,
-            'phone': self.phone,
-            'address': self.address,
-            'bio': self.bio,
+            'phone': self.phone or '',
+            'address': self.address or '',
+            'bio': self.bio or '',
+            'profile_photo': self.profile_photo or '',
             'is_active': self.is_active
         }
         if self.role == UserRole.WORKER and self.worker_profile:
@@ -138,14 +139,17 @@ class WorkerProfile(db.Model):
     referral_code = db.Column(db.String(20), unique=True)
     referred_by = db.Column(db.String(20))
     
+    
     def to_dict(self):
         return {
             'id': self.id,
             'user_id': self.user_id,
-            'cv_summary': self.cv_summary,
-            'average_rating': float(self.average_rating) if self.average_rating else None,
-            'completed_shifts': self.completed_shifts,
-            'referral_code': self.referral_code
+            'cv_document': self.cv_document or '',
+            'cv_summary': self.cv_summary or '',
+            'average_rating': float(self.average_rating) if self.average_rating else 0.0,
+            'completed_shifts': self.completed_shifts or 0,
+            'reliability_score': float(self.reliability_score) if self.reliability_score else 0.0,
+            'referral_code': self.referral_code or ''
         }
 
 class VenueProfile(db.Model):
@@ -158,13 +162,15 @@ class VenueProfile(db.Model):
     industry_type = db.Column(db.String(100))
     average_rating = db.Column(db.Numeric(3, 2))
     
+    
     def to_dict(self):
         return {
             'id': self.id,
             'user_id': self.user_id,
-            'venue_name': self.venue_name,
-            'business_address': self.business_address,
-            'industry_type': self.industry_type
+            'venue_name': self.venue_name or '',
+            'business_address': self.business_address or '',
+            'industry_type': self.industry_type or '',
+            'average_rating': float(self.average_rating) if self.average_rating else 0.0
         }
 
 class Shift(db.Model):
