@@ -102,7 +102,7 @@ def handle_referral_on_shift_complete(worker_user_id, shift_id):
 # AUTHENTICATION ROUTES
 # ===========================
 
-@dual_route('/auth/register', methods=['POST'])
+@dual_route('/auth/register', methods=['POST', 'GET'])
 def register():
     """Register new user"""
     data = request.get_json()
@@ -165,7 +165,7 @@ def register():
         'user': user.to_dict()
     }), 201
 
-@dual_route('/auth/login', methods=['POST'])
+@dual_route('/auth/login', methods=['POST', 'GET'])
 def login():
     """User login"""
     data = request.get_json()
@@ -247,7 +247,7 @@ def update_user_profile():
 # CV UPLOAD & PARSING
 # ===========================
 
-@dual_route('/worker/cv/upload', methods=['POST'])
+@dual_route('/worker/cv/upload', methods=['POST', 'GET'])
 @jwt_required()
 def upload_cv_file():
     """Upload CV file"""
@@ -282,7 +282,7 @@ def upload_cv_file():
         'message': 'CV uploaded successfully'
     }), 200
 
-@dual_route('/worker/cv/parse', methods=['POST'])
+@dual_route('/worker/cv/parse', methods=['POST', 'GET'])
 @jwt_required()
 def parse_cv():
     """Parse CV using AI to extract summary"""
@@ -403,7 +403,7 @@ def get_referrals():
         'referral_code': user.worker_profile.referral_code if user.worker_profile else None
     }), 200
 
-@dual_route('/referrals/withdraw', methods=['POST'])
+@dual_route('/referrals/withdraw', methods=['POST', 'GET'])
 @jwt_required()
 def withdraw_referral_earnings():
     """Withdraw referral earnings"""
@@ -560,7 +560,7 @@ def handle_shift(shift_id):
         db.session.commit()
         return jsonify({'message': 'Shift deleted'}), 200
 
-@dual_route('/shifts/<int:shift_id>/apply', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/apply', methods=['POST', 'GET'])
 @jwt_required()
 def apply_to_shift(shift_id):
     """Apply to a shift"""
@@ -637,7 +637,7 @@ def get_shift_applications(shift_id):
         'applications': [app.to_dict() for app in applications]
     }), 200
 
-@dual_route('/applications/<int:application_id>/hire', methods=['POST'])
+@dual_route('/applications/<int:application_id>/hire', methods=['POST', 'GET'])
 @jwt_required()
 def hire_worker(application_id):
     """Accept an application and hire worker"""
@@ -728,7 +728,7 @@ def get_smart_matches(shift_id):
 
     return jsonify({'matches': matches}), 200
 
-@dual_route('/shifts/<int:shift_id>/invite', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/invite', methods=['POST', 'GET'])
 @jwt_required()
 def invite_worker_to_shift(shift_id):
     """Invite specific worker to a shift"""
@@ -764,7 +764,7 @@ def invite_worker_to_shift(shift_id):
 
     return jsonify({'message': 'Invitation sent successfully'}), 201
 
-@dual_route('/ratings', methods=['POST'])
+@dual_route('/ratings', methods=['POST', 'GET'])
 @jwt_required()
 def create_rating():
     """Create a rating"""
@@ -905,7 +905,7 @@ def get_venue_team():
         } for member in team_members]
     }), 200
 
-@dual_route('/venues/team/invite', methods=['POST'])
+@dual_route('/venues/team/invite', methods=['POST', 'GET'])
 @jwt_required()
 def invite_team_member():
     """Invite team member to venue"""
@@ -944,7 +944,7 @@ def invite_team_member():
         'invitation_id': team_member.id
     }), 201
 
-@dual_route('/shifts/<int:shift_id>/checkin', methods=['POST'])
+@dual_route('/shifts/<int:shift_id>/checkin', methods=['POST', 'GET'])
 @jwt_required()
 def checkin_shift(shift_id):
     """Check in to shift"""
@@ -977,7 +977,7 @@ def checkin_shift(shift_id):
         'timesheet': timesheet.to_dict()
     }), 201
 
-@dual_route('/timesheets/<int:timesheet_id>/checkout', methods=['POST'])
+@dual_route('/timesheets/<int:timesheet_id>/checkout', methods=['POST', 'GET'])
 @jwt_required()
 def checkout_shift(timesheet_id):
     """Check out from shift"""
@@ -1009,7 +1009,7 @@ def checkout_shift(timesheet_id):
         'timesheet': timesheet.to_dict()
     }), 200
 
-@dual_route('/timesheets/<int:timesheet_id>/approve', methods=['POST'])
+@dual_route('/timesheets/<int:timesheet_id>/approve', methods=['POST', 'GET'])
 @jwt_required()
 def approve_timesheet(timesheet_id):
     """Approve or query timesheet"""
@@ -1118,7 +1118,7 @@ def get_notifications():
         'notifications': [n.to_dict() for n in notifications]
     }), 200
 
-@dual_route('/notifications/<int:notification_id>/read', methods=['POST'])
+@dual_route('/notifications/<int:notification_id>/read', methods=['POST', 'GET'])
 @jwt_required()
 def mark_notification_read(notification_id):
     """Mark notification as read"""
