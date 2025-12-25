@@ -139,33 +139,19 @@ class WorkerProfile(db.Model):
     referral_code = db.Column(db.String(20), unique=True)
     referred_by = db.Column(db.String(20))
     
-    
     def to_dict(self):
-        
-        data = {
+        return {
             'id': self.id,
-            'email': self.email,
-            'role': self.role.value,
-            'name': self.name,
-            'is_active': self.is_active
+            'user_id': self.user_id,
+            'cv_document': self.cv_document or '',
+            'cv_summary': self.cv_summary or '',
+            'average_rating': float(self.average_rating) if self.average_rating else 0.0,
+            'completed_shifts': self.completed_shifts or 0,
+            'reliability_score': float(self.reliability_score) if self.reliability_score else 0.0,
+            'referral_code': self.referral_code or '',
+            'referred_by': self.referred_by or ''
         }
         
-        # Only add optional fields if they exist
-        if self.phone:
-            data['phone'] = self.phone
-        if self.address:
-            data['address'] = self.address
-        if self.bio:
-            data['bio'] = self.bio
-        if self.profile_photo:
-            data['profile_photo'] = self.profile_photo
-        
-        if self.role == UserRole.WORKER and self.worker_profile:
-            data['worker_profile'] = self.worker_profile.to_dict()
-        elif self.role == UserRole.VENUE and self.venue_profile:
-            data['venue_profile'] = self.venue_profile.to_dict()
-        
-        return data
 class VenueProfile(db.Model):
     __tablename__ = 'venue_profiles'
     
