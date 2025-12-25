@@ -4,7 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class ApiService {
   // Change this to your backend URL
-  static const String baseUrl = 'https://mathtales.top/api'; // Android emulator
+  static const String baseUrl = 'https://mathtales.top/api'; // All users (worker, venue, admin)
   // static const String baseUrl = 'http://localhost:5000/api'; // iOS simulator
   // static const String baseUrl = 'https://your-backend.com/api'; // Production
   
@@ -76,6 +76,7 @@ class ApiService {
     required String role,
     String? phone,
     String? venueName,
+    String? referralCode,
   }) async {
     try {
       final response = await http.post(
@@ -88,6 +89,7 @@ class ApiService {
           'role': role,
           'phone': phone,
           'venue_name': venueName,
+          if (referralCode != null && referralCode.isNotEmpty) 'referral_code': referralCode,
         }),
       );
 
@@ -136,11 +138,15 @@ class ApiService {
       Uri.parse('$baseUrl/auth/me'),
       headers: await getHeaders(),
     );
-    
     if (response.statusCode == 200) {
       return jsonDecode(response.body);
     } else {
-      throw Exception('Failed to load user');
+      String details = response.body;
+      try {
+        final data = jsonDecode(response.body);
+        details = data['error'] ?? data['message'] ?? response.body;
+      } catch (_) {}
+      throw Exception('Failed to load user: $details');
     }
   }
   
@@ -160,12 +166,16 @@ class ApiService {
 
     final uri = Uri.parse('$baseUrl/shifts/search').replace(queryParameters: queryParams);
     final response = await http.get(uri, headers: await getHeaders());
-
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       return List<Map<String, dynamic>>.from(data['shifts']);
     } else {
-      throw Exception('Failed to load shifts');
+      String details = response.body;
+      try {
+        final data = jsonDecode(response.body);
+        details = data['error'] ?? data['message'] ?? response.body;
+      } catch (_) {}
+      throw Exception('Failed to load shifts: ' + details);
     }
   }
 
@@ -899,6 +909,18 @@ class ApiService {
       return List<Map<String, dynamic>>.from(data['ratings']);
     } else {
       throw Exception('Failed to load ratings');
+    }
+  }
+
+  Future<void> updateEmail(String newEmail) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/user/email'),
+      headers: await getHeaders(),
+      body: jsonEncode({'email': newEmail}),
+    );
+    if (response.statusCode != 200) {
+      final data = jsonDecode(response.body);
+      throw Exception(data['error'] ?? 'Failed to update email');
     }
   }
 }

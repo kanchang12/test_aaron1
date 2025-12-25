@@ -3,7 +3,11 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../../services/api_service.dart';
 import '../../models/models.dart';
+
 import '../auth/login_screen.dart';
+import 'my_applications_screen.dart';
+import 'my_applications_screen.dart';
+import 'worker_profile_screen.dart';
 
 class WorkerHomeScreen extends StatefulWidget {
   const WorkerHomeScreen({super.key});
@@ -17,7 +21,7 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
 
   final List<Widget> _screens = [
     const ShiftSearchScreen(),
-    const MyApplicationsScreen(),
+    const MyApplicationsScreen(), // Use the real implementation
     const WorkerProfileScreen(),
   ];
 
@@ -471,41 +475,4 @@ class InfoRow extends StatelessWidget {
   }
 }
 
-// Placeholder screens
-class MyApplicationsScreen extends StatelessWidget {
-  const MyApplicationsScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('My Applications')),
-      body: const Center(child: Text('Applications screen - Coming soon')),
-    );
-  }
-}
-
-class WorkerProfileScreen extends StatelessWidget {
-  const WorkerProfileScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Profile')),
-      body: Center(
-        child: ElevatedButton(
-          onPressed: () async {
-            final api = Provider.of<ApiService>(context, listen: false);
-            await api.clearToken();
-            if (context.mounted) {
-              Navigator.of(context).pushAndRemoveUntil(
-                MaterialPageRoute(builder: (_) => const LoginScreen()),
-                (route) => false,
-              );
-            }
-          },
-          child: const Text('Logout'),
-        ),
-      ),
-    );
-  }
-}
+// ...existing code...

@@ -670,7 +670,19 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Edit Venue Profile'),
               subtitle: const Text('Update venue name, address, contact info'),
               onTap: () {
-                // TODO: Implement profile editing
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Edit Venue Profile'),
+                    content: const Text('This feature is coming soon!'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
               },
             ),
           ),
@@ -682,7 +694,19 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Payment Method Setup'),
               subtitle: const Text('Add or update Stripe/bank details'),
               onTap: () {
-                // TODO: Implement payment setup
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Payment Method Setup'),
+                    content: const Text('This feature is coming soon!'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
               },
             ),
           ),
@@ -694,7 +718,19 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Manage Team'),
               subtitle: const Text('Invite, edit, or remove team members'),
               onTap: () {
-                // TODO: Implement team management
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Manage Team'),
+                    content: const Text('This feature is coming soon!'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
               },
             ),
           ),
@@ -706,7 +742,19 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Shift Analytics & Reports'),
               subtitle: const Text('View shift history, fill rates, spend, and more'),
               onTap: () {
-                // TODO: Implement analytics and reporting
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Shift Analytics & Reports'),
+                    content: const Text('This feature is coming soon!'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
               },
             ),
           ),
@@ -718,7 +766,19 @@ class VenueProfileScreen extends StatelessWidget {
               title: const Text('Ratings & Reviews'),
               subtitle: const Text('See feedback from workers and venues'),
               onTap: () {
-                // TODO: Implement ratings and reviews
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Ratings & Reviews'),
+                    content: const Text('This feature is coming soon!'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
+                  ),
+                );
               },
             ),
           ),

@@ -46,11 +46,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
         password: _passwordController.text,
         name: _nameController.text.trim(),
         role: _selectedRole,
-        phone: _phoneController.text.trim().isNotEmpty 
-          ? _phoneController.text.trim() 
+        phone: _phoneController.text.trim().isNotEmpty
+          ? _phoneController.text.trim()
           : null,
-        venueName: _selectedRole == 'venue' 
-          ? _venueNameController.text.trim() 
+        venueName: _selectedRole == 'venue'
+          ? _venueNameController.text.trim()
           : null,
         referralCode: _referralCodeController.text.trim().isNotEmpty
           ? _referralCodeController.text.trim()

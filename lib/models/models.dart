@@ -52,6 +52,9 @@ class User {
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
+    // Extract worker_profile data if exists
+    final workerProfile = json['worker_profile'];
+
     return User(
       id: json['id'],
       email: json['email'],
@@ -61,16 +64,16 @@ class User {
       profilePhoto: json['profile_photo'],
       isActive: json['is_active'] ?? true,
       createdAt: json['created_at'],
-      cvUrl: json['cv_url'],
-      cvSummary: json['cv_summary'],
+      cvUrl: json['cv_url'] ?? workerProfile?['cv_document'],
+      cvSummary: json['cv_summary'] ?? workerProfile?['cv_summary'],
       bio: json['bio'],
       address: json['address'],
-      reliabilityScore: json['reliability_score']?.toDouble(),
-      averageRating: json['average_rating']?.toDouble(),
-      completedShifts: json['completed_shifts'],
-      referralCode: json['referral_code'],
-      referralBalance: json['referral_balance']?.toDouble(),
-      referredBy: json['referred_by'],
+      reliabilityScore: json['reliability_score']?.toDouble() ?? workerProfile?['reliability_score']?.toDouble(),
+      averageRating: json['average_rating']?.toDouble() ?? workerProfile?['average_rating']?.toDouble(),
+      completedShifts: json['completed_shifts'] ?? workerProfile?['completed_shifts'],
+      referralCode: json['referral_code'] ?? workerProfile?['referral_code'],
+      referralBalance: json['referral_balance']?.toDouble() ?? workerProfile?['referral_earnings']?.toDouble(),
+      referredBy: json['referred_by'] ?? workerProfile?['referred_by'],
       parentVenueId: json['parent_venue_id'],
       venueRole: json['venue_role'],
     );

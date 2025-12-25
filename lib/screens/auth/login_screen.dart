@@ -40,18 +40,20 @@ class _LoginScreenState extends State<LoginScreen> {
 
       if (!mounted) return;
 
+      if (result == null || result['user'] == null || result['user']['role'] == null) {
+        throw Exception('Login succeeded but user data is missing or malformed. Please contact support.');
+      }
+
       final role = result['user']['role'];
-      
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => role == 'worker' 
-              ? const WorkerHomeScreen() 
+          builder: (_) => role == 'worker'
+              ? const WorkerHomeScreen()
               : const VenueHomeScreen(),
         ),
       );
     } catch (e) {
       if (!mounted) return;
-      
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(e.toString().replaceAll('Exception: ', '')),
